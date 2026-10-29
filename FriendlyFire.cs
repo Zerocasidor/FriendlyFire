@@ -49,6 +49,9 @@ namespace FriendlyFire
         public List<string> friendHidden = new List<string>();   // friend's tasks removed on this PC (don't bring them back)
         public List<TaskItem> giving = new List<TaskItem>();     // my tasks dragged to the friend, sent until their list shows them
         public List<string> giftsDone = new List<string>();      // gifts from the friend already taken or thrown away here
+        public bool notifyAll = true;                            // pop-ups at all
+        public bool notifySound = true;
+        public List<string> notifyOff = new List<string> { "accept", "reject" };   // kinds turned off in Settings → ขั้นสูง
     }
 
     // One message on the topic. Every message carries the sender's task list, so the other side is always up to date.
@@ -241,7 +244,26 @@ namespace FriendlyFire
     {
         static readonly Queue<Action> waiting = new Queue<Action>();
         static Notice current;
+        public static Config Settings;   // which kinds may pop up, and the sound
         protected override bool ShowWithoutActivation { get { return true; } }
+
+        // The kinds of pop-ups you can turn off in Settings (problems and answers to your own clicks always show)
+        public static readonly string[][] Kinds =
+        {
+            new[] { "done",   "เพื่อนทำงานสำเร็จ" },
+            new[] { "react",  "เพื่อนส่งรีแอคชัน (🔥 👏 💪 😎) ให้" },
+            new[] { "gift",   "เพื่อนส่งงานให้" },
+            new[] { "accept", "เพื่อนรับงานที่คุณส่ง" },
+            new[] { "reject", "เพื่อนไม่รับงานที่คุณส่ง" },
+            new[] { "sent",   "ยืนยันเมื่อคุณส่งอะไรให้เพื่อน" },
+            new[] { "update", "แอปอัปเดตเป็นเวอร์ชันใหม่" },
+        };
+
+        public static void Show(string kind, string title, string text, Action<string> react)
+        {
+            if (Settings != null && (!Settings.notifyAll || Settings.notifyOff.Contains(kind))) return;
+            Show(title, text, react);
+        }
 
         public static void Show(string title, string text, Action<string> react)
         {
@@ -312,6 +334,7 @@ namespace FriendlyFire
 
         static void PlaySound()
         {
+            if (Settings != null && !Settings.notifySound) return;
             try
             {
                 string wav = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), @"Media\Windows Notify Messaging.wav");
@@ -502,7 +525,12 @@ namespace FriendlyFire
             Text = "Friendly Fire"; Icon = Program.Flame; Font = Util.UiFont(10.5f); ClientSize = new Size(760, 520);
             StartPosition = FormStartPosition.CenterScreen; MinimumSize = new Size(560, 380);
 
-            status.Dock = DockStyle.Top; status.Height = 30; status.Padding = new Padding(10, 6, 0, 0); status.ForeColor = Color.DimGray;
+            var top = new Panel { Dock = DockStyle.Top, Height = 34, Padding = new Padding(0, 4, 10, 0) };
+            var gear = new Button { Text = "⚙ ตั้งค่า", Dock = DockStyle.Right, Width = 96, FlatStyle = FlatStyle.Flat };
+            gear.FlatAppearance.BorderColor = Color.Silver;
+            gear.Click += (s, e) => app.ShowSettings();
+            status.Dock = DockStyle.Fill; status.Padding = new Padding(10, 4, 0, 0); status.ForeColor = Color.DimGray;
+            top.Controls.Add(status); top.Controls.Add(gear);
 
             // Bottom: tell the friend about anything you finished
             var bottom = new Panel { Dock = DockStyle.Bottom, Height = 54, Padding = new Padding(10, 8, 10, 10) };
@@ -574,7 +602,7 @@ namespace FriendlyFire
             Activated += (s, e) => app.MarkSeen(true);
 
             grid.Controls.Add(myBox, 0, 0); grid.Controls.Add(theirBox, 1, 0);
-            Controls.Add(grid); Controls.Add(bottom); Controls.Add(status);
+            Controls.Add(grid); Controls.Add(bottom); Controls.Add(top);
 
             FormClosing += (s, e) => { if (!Exiting && e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; Hide(); } };
             FillMine(); FillTheirs(); SetStatus(false);
@@ -653,7 +681,7 @@ namespace FriendlyFire
             if (text == "") { brag.Focus(); return; }
             brag.Text = "";
             app.Changed("done", text);
-            Notice.Show("ส่งให้ " + app.FriendLabel + " แล้ว 🎉", text, null);
+            Notice.Show("sent", "ส่งให้ " + app.FriendLabel + " แล้ว 🎉", text, null);
         }
 
         public void FillMine()
@@ -685,6 +713,69 @@ namespace FriendlyFire
         }
     }
 
+    // ---------- settings: pop-ups, start with Windows, update log ----------
+
+    class SettingsForm : Form
+    {
+        public SettingsForm(App app)
+        {
+            var cfg = app.Cfg;
+            Text = "ตั้งค่า Friendly Fire"; Icon = Program.Flame; Font = Util.UiFont(10.5f);
+            FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = false; MinimizeBox = false; StartPosition = FormStartPosition.CenterScreen;
+            AutoSize = true; AutoSizeMode = AutoSizeMode.GrowAndShrink; Padding = new Padding(14);
+
+            var page = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoSize = true, Dock = DockStyle.Fill };
+            Controls.Add(page);
+            Func<string, Label> heading = s => new Label { Text = s, AutoSize = true, Font = new Font("Segoe UI", 11.5f, FontStyle.Bold), ForeColor = Color.FromArgb(190, 70, 0), Margin = new Padding(0, 10, 0, 4) };
+
+            // Pop-ups: all on/off, sound, and each kind under "ขั้นสูง"
+            page.Controls.Add(heading("การแจ้งเตือน"));
+            var all = new CheckBox { Text = "เปิดการแจ้งเตือนทั้งหมด", Checked = cfg.notifyAll, AutoSize = true };
+            var sound = new CheckBox { Text = "เล่นเสียงตอนแจ้งเตือน", Checked = cfg.notifySound, AutoSize = true };
+            var more = new LinkLabel { Text = "ขั้นสูง ▸", AutoSize = true, Margin = new Padding(3, 6, 3, 2) };
+            var kinds = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoSize = true, Visible = false, Margin = new Padding(22, 0, 0, 0) };
+            foreach (var k in Notice.Kinds)
+            {
+                string id = k[0];
+                var box = new CheckBox { Text = k[1], Checked = !cfg.notifyOff.Contains(id), AutoSize = true };
+                box.CheckedChanged += (s, e) =>
+                {
+                    cfg.notifyOff.Remove(id);
+                    if (!box.Checked) cfg.notifyOff.Add(id);
+                    app.Save();
+                };
+                kinds.Controls.Add(box);
+            }
+            Action enable = () => { sound.Enabled = kinds.Enabled = all.Checked; };
+            all.CheckedChanged += (s, e) => { cfg.notifyAll = all.Checked; app.Save(); enable(); };
+            sound.CheckedChanged += (s, e) => { cfg.notifySound = sound.Checked; app.Save(); };
+            more.LinkClicked += (s, e) => { kinds.Visible = !kinds.Visible; more.Text = kinds.Visible ? "ขั้นสูง ▾" : "ขั้นสูง ▸"; };
+            enable();
+            page.Controls.AddRange(new Control[] { all, sound, more, kinds });
+
+            page.Controls.Add(heading("ทั่วไป"));
+            var start = new CheckBox { Text = "เปิดพร้อม Windows", Checked = cfg.startWithWindows, AutoSize = true, Enabled = !app.TestCopy };
+            start.CheckedChanged += (s, e) => app.SetStartup(start.Checked);
+            page.Controls.Add(start);
+
+            // What changed in each version
+            page.Controls.Add(heading("บันทึกการอัปเดต  (ตอนนี้ v" + Program.Version + ")"));
+            var log = new TextBox { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical, Width = 440, Height = 190,
+                                    Text = Program.Changelog.Replace("\n", "\r\n"), BackColor = SystemColors.Window, Font = Util.UiFont(10) };
+            page.Controls.Add(log);
+
+            var row = new FlowLayoutPanel { AutoSize = true, Margin = new Padding(0, 10, 0, 0) };
+            var check = new Button { Text = "ตรวจหาอัปเดต", AutoSize = true, Height = 32 };
+            check.Click += (s, e) => app.CheckUpdate(true);
+            var close = new Button { Text = "ปิด", Width = 90, Height = 32, DialogResult = DialogResult.Cancel };
+            close.Click += (s, e) => Close();
+            row.Controls.Add(check); row.Controls.Add(close);
+            page.Controls.Add(row);
+            CancelButton = close;
+            Shown += (s, e) => log.Select(0, 0);
+        }
+    }
+
     static class Native
     {
         [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
@@ -705,6 +796,9 @@ namespace FriendlyFire
         readonly System.Windows.Forms.Timer syncTimer = new System.Windows.Forms.Timer(), updateTimer = new System.Windows.Forms.Timer(),
                                             tidyTimer = new System.Windows.Forms.Timer();
         bool updating;
+        ToolStripMenuItem startItem;
+        SettingsForm settings;
+        public bool TestCopy { get { return testCopy; } }
 
         public string FriendLabel { get { return Cfg.friendName == "" ? "เพื่อน" : Cfg.friendName; } }
 
@@ -729,6 +823,7 @@ namespace FriendlyFire
                 }
             }
             Save();
+            Notice.Settings = Cfg;
 
             main = new MainForm(this);
             relay = new Relay("friendlyfire-" + Cfg.code.ToLowerInvariant(), Cfg.clientId);
@@ -740,8 +835,9 @@ namespace FriendlyFire
             var menu = new ContextMenuStrip();
             menu.Items.Add("เปิด Friendly Fire", null, (s, e) => ShowMain());
             menu.Items.Add("รหัสเชิญ...", null, (s, e) => ShowCode());
-            var startItem = new ToolStripMenuItem("เปิดพร้อม Windows") { Checked = Cfg.startWithWindows, Enabled = !testCopy };
-            startItem.Click += (s, e) => { Cfg.startWithWindows = !Cfg.startWithWindows; startItem.Checked = Cfg.startWithWindows; Save(); ApplyStartup(); };
+            menu.Items.Add("ตั้งค่า...", null, (s, e) => ShowSettings());
+            startItem = new ToolStripMenuItem("เปิดพร้อม Windows") { Checked = Cfg.startWithWindows, Enabled = !testCopy };
+            startItem.Click += (s, e) => SetStartup(!Cfg.startWithWindows);
             menu.Items.Add(startItem);
             menu.Items.Add("ตรวจหาอัปเดต", null, (s, e) => CheckUpdate(true));
             menu.Items.Add(new ToolStripSeparator());
@@ -773,7 +869,7 @@ namespace FriendlyFire
             if (Program.CheckNow) CheckUpdate(true);
             if (firstRun || testCopy) ShowMain();
             if (created) ShowCode();
-            if (justUpdated) Notice.Show("Friendly Fire อัปเดตแล้ว", "ตอนนี้เป็นเวอร์ชัน " + Program.Version, null);
+            if (justUpdated) Notice.Show("update", "Friendly Fire อัปเดตแล้ว", "ตอนนี้เป็นเวอร์ชัน " + Program.Version, null);
         }
 
         public Msg Make(string type, string text)
@@ -809,7 +905,7 @@ namespace FriendlyFire
             Cfg.giving.Add(new TaskItem { id = t.id, text = t.text });
             Changed("give", t.text);
             main.FillTheirs();
-            Notice.Show("ส่งงานให้ " + FriendLabel + " แล้ว 🎁", t.text, null);
+            Notice.Show("sent", "ส่งงานให้ " + FriendLabel + " แล้ว 🎁", t.text, null);
         }
 
         // ✓ keeps a gift as my own task, ✗ throws it away; the friend gets told either way
@@ -854,24 +950,24 @@ namespace FriendlyFire
             {
                 main.FillMine();
                 relay.Publish(Make("sync", null));   // the friend sees them as "รอรับ" and stops sending
-                foreach (var g in newGifts) Notice.Show("🎁 " + FriendLabel + " ส่งงานให้คุณ", g.text + "\n(เปิดแอปแล้วกด ✓ รับ หรือ ✗ ทิ้ง)", null);
+                foreach (var g in newGifts) Notice.Show("gift", "🎁 " + FriendLabel + " ส่งงานให้คุณ", g.text + "\n(เปิดแอปแล้วกด ✓ รับ หรือ ✗ ทิ้ง)", null);
             }
             main.SetStatus(true);
             if (!fresh) return;
 
             string when = Util.NowSec() - time > 300 ? "  (" + Util.Local(time).ToString("HH:mm", CultureInfo.InvariantCulture) + ")" : "";
             if (m.type == "done")
-                Notice.Show("🔥 " + FriendLabel + " ทำสำเร็จ!", m.text + when, emoji =>
+                Notice.Show("done", "🔥 " + FriendLabel + " ทำสำเร็จ!", m.text + when, emoji =>
                 {
                     relay.Publish(Make("react", emoji));
-                    Notice.Show("ส่ง " + emoji + " ให้ " + FriendLabel + " แล้ว", null, null);
+                    Notice.Show("sent", "ส่ง " + emoji + " ให้ " + FriendLabel + " แล้ว", null, null);
                 });
             else if (m.type == "react")
-                Notice.Show(FriendLabel + " ส่ง " + m.text + " ให้คุณ" + when, null, null);
+                Notice.Show("react", FriendLabel + " ส่ง " + m.text + " ให้คุณ" + when, null, null);
             else if (m.type == "accept")
-                Notice.Show("👍 " + FriendLabel + " รับงานที่คุณส่งแล้ว" + when, m.text, null);
+                Notice.Show("accept", "👍 " + FriendLabel + " รับงานที่คุณส่งแล้ว" + when, m.text, null);
             else if (m.type == "reject")
-                Notice.Show(FriendLabel + " ไม่รับงานที่คุณส่ง" + when, m.text, null);
+                Notice.Show("reject", FriendLabel + " ไม่รับงานที่คุณส่ง" + when, m.text, null);
         }
 
         // The friend's new list, but finished tasks stay here until they've been seen for a day (or removed here)
@@ -988,6 +1084,21 @@ namespace FriendlyFire
             ExitThread();
         }
 
+        public void ShowSettings()
+        {
+            if (settings == null || settings.IsDisposed) settings = new SettingsForm(this);
+            settings.Show();
+            settings.Activate();
+        }
+
+        public void SetStartup(bool on)
+        {
+            Cfg.startWithWindows = on;
+            startItem.Checked = on;
+            Save();
+            ApplyStartup();
+        }
+
         void ApplyStartup()
         {
             if (testCopy) return;
@@ -1002,7 +1113,7 @@ namespace FriendlyFire
             catch { }
         }
 
-        void CheckUpdate(bool byHand)
+        public void CheckUpdate(bool byHand)
         {
             if (updating) return;
             updating = true;
@@ -1049,11 +1160,27 @@ namespace FriendlyFire
 
     static class Program
     {
-        public const string Version = "1.0.2";
+        public const string Version = "1.0.3";
         public static Icon Flame;
         static Mutex mutex;
         public static string RestartArgs = "";   // the same -Data/-Name/-Code after an update
         public static bool CheckNow;              // -CheckUpdate: look for an update right away (also in test copies)
+
+        // Shown in Settings → บันทึกการอัปเดต (newest first; add a line with each release)
+        public const string Changelog =
+            "v1.0.3\n" +
+            "• ปุ่ม ⚙ ตั้งค่า: เปิด/ปิดการแจ้งเตือนทั้งหมด เปิด/ปิดเสียง และเลือกทีละอย่างใน \"ขั้นสูง\"\n" +
+            "• ดูบันทึกการอัปเดตได้ในหน้าตั้งค่า\n" +
+            "• การแจ้งเตือนเมื่อเพื่อนรับ/ไม่รับงานที่คุณส่ง ปิดไว้ตั้งต้น (เปิดได้ใน \"ขั้นสูง\")\n\n" +
+            "v1.0.2\n" +
+            "• ข้อความยาวขึ้นบรรทัดใหม่ ไม่ทะลุกรอบ\n" +
+            "• ลากงานขึ้นลงเพื่อเรียงลำดับ\n" +
+            "• ลากงานไปวางฝั่งเพื่อนเพื่อส่งให้ เพื่อนกด ✓ รับ หรือ ✗ ทิ้ง\n\n" +
+            "v1.0.1\n" +
+            "• ถ้าต่างคนต่างสร้างคู่ ใส่รหัสของเพื่อนได้ในหน้า \"รหัสเชิญ...\"\n" +
+            "• งานที่เสร็จไม่หายทันที: หายเอง 24 ชั่วโมงหลังเห็น หรือคลิกขวาลบ (แต่ละเครื่องแยกกัน)\n\n" +
+            "v1.0.0\n" +
+            "• เวอร์ชันแรก: รายการงาน, ติ๊กแล้วเพื่อนเด้ง, ปุ่ม \"เสร็จแล้ว!\", ส่งรีแอคชัน, อัปเดตตัวเองจาก GitHub";
 
         public static string CleanCode(string s)
         {
