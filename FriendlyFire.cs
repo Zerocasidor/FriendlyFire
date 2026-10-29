@@ -52,6 +52,7 @@ namespace FriendlyFire
         public bool notifyAll = true;                            // pop-ups at all
         public bool notifySound = true;
         public List<string> notifyOff = new List<string> { "accept", "reject" };   // kinds turned off in Settings → ขั้นสูง
+        public List<string> reactions = new List<string> { "🔥", "😎", "👍", "❓" };   // the 4 reaction buttons, chosen in Settings
         public long notifyMuteUntil;                             // unix s: all pop-ups paused until then (🔕 on a pop-up)
     }
 
@@ -66,6 +67,7 @@ namespace FriendlyFire
         public List<TaskItem> tasks;
         public List<TaskItem> gifts;   // tasks given to the receiver (sent again until they show up in the receiver's list)
         public List<string> got;       // ids of gifts the sender has already handled
+        public string ver;             // sender's app version: a newer one makes the receiver update right away
     }
 
     static class Util
@@ -247,7 +249,15 @@ namespace FriendlyFire
         static Notice current;
         public static Config Settings;   // which kinds may pop up, and the sound
         public static Action SaveSettings;
-        public static readonly string[] Reactions = { "👍", "🔥", "😎", "❓" };
+        public static readonly string[] DefaultReactions = { "🔥", "😎", "👍", "❓" };
+        public static string[] Reactions
+        {
+            get
+            {
+                var r = Settings == null ? null : Settings.reactions.Where(e => !string.IsNullOrWhiteSpace(e)).Take(4).ToArray();
+                return r == null || r.Length == 0 ? DefaultReactions : r;
+            }
+        }
         protected override bool ShowWithoutActivation { get { return true; } }
         static readonly Color Edge = Color.FromArgb(255, 170, 100), Paper = Color.FromArgb(255, 243, 230);
 
@@ -255,7 +265,7 @@ namespace FriendlyFire
         public static readonly string[][] Kinds =
         {
             new[] { "done",   "เพื่อนทำงานสำเร็จ" },
-            new[] { "react",  "เพื่อนส่งรีแอคชัน (👍 🔥 😎 ❓) ให้" },
+            new[] { "react",  "เพื่อนส่งรีแอคชันให้" },
             new[] { "gift",   "เพื่อนส่งงานให้" },
             new[] { "accept", "เพื่อนรับงานที่คุณส่ง" },
             new[] { "reject", "เพื่อนไม่รับงานที่คุณส่ง" },
@@ -813,6 +823,32 @@ namespace FriendlyFire
             }
             page.Controls.AddRange(new Control[] { all, paused, sound, more, kinds });
 
+            // The 4 reaction buttons on a friend's "ทำสำเร็จ" pop-up: pick from the list or type/paste any emoji
+            page.Controls.Add(heading("ปุ่มรีแอคชัน"));
+            page.Controls.Add(new Label { Text = "เลือกจากรายการ หรือพิมพ์/วางอีโมจิเองก็ได้", AutoSize = true, ForeColor = Color.DimGray });
+            var slots = new FlowLayoutPanel { AutoSize = true, Margin = new Padding(0, 4, 0, 0) };
+            var choices = new object[] { "🔥", "😎", "👍", "❓", "😂", "🤣", "😭", "😱", "🤯", "🥳", "💀", "🫡", "🙏", "👏", "💪", "❤️", "💯", "🎉", "🤔", "😵‍💫", "🐐", "👀", "🫠", "😴", "⭐", "🚀" };
+            while (cfg.reactions.Count < 4) cfg.reactions.Add(Notice.DefaultReactions[cfg.reactions.Count]);
+            for (int i = 0; i < 4; i++)
+            {
+                int slot = i;
+                var c = new ComboBox { DropDownStyle = ComboBoxStyle.DropDown, Font = Util.EmojiFont(14), Width = 76, MaxDropDownItems = 12, Text = cfg.reactions[slot] };
+                c.Items.AddRange(choices);
+                c.TextChanged += (s, e) =>
+                {
+                    string v = c.Text.Trim();
+                    if (v == "" || v.Length > 12) return;   // keep the last good one
+                    cfg.reactions[slot] = v;
+                    app.Save();
+                };
+                c.Leave += (s, e) => c.Text = cfg.reactions[slot];
+                slots.Controls.Add(c);
+            }
+            var reset = new LinkLabel { Text = "ค่าเริ่มต้น", AutoSize = true, Margin = new Padding(8, 12, 0, 0) };
+            reset.LinkClicked += (s, e) => { for (int i = 0; i < 4; i++) slots.Controls[i].Text = Notice.DefaultReactions[i]; };
+            slots.Controls.Add(reset);
+            page.Controls.Add(slots);
+
             page.Controls.Add(heading("ทั่วไป"));
             var start = new CheckBox { Text = "เปิดพร้อม Windows", Checked = cfg.startWithWindows, AutoSize = true, Enabled = !app.TestCopy };
             start.CheckedChanged += (s, e) => app.SetStartup(start.Checked);
@@ -922,8 +958,8 @@ namespace FriendlyFire
             if (!testCopy)
             {
                 Updater.CleanUp();
-                updateTimer.Interval = 60 * 1000;   // first check a minute after start, then every 3 hours
-                updateTimer.Tick += (s, e) => { updateTimer.Interval = 3 * 3600 * 1000; Updater.CleanUp(); CheckUpdate(false); };
+                updateTimer.Interval = 10 * 1000;   // first check right after start (once the network is up), then every hour
+                updateTimer.Tick += (s, e) => { updateTimer.Interval = 3600 * 1000; Updater.CleanUp(); CheckUpdate(false); };
                 updateTimer.Start();
             }
 
@@ -940,7 +976,7 @@ namespace FriendlyFire
                                 .ToList();
             var gifts = Cfg.giving.Select(t => new TaskItem { id = t.id, text = Short(t.text, 300) }).ToList();
             var got = Cfg.giftsDone.Skip(Math.Max(0, Cfg.giftsDone.Count - 50)).ToList();
-            return new Msg { from = Cfg.clientId, name = Cfg.name, type = type, text = text, time = Util.NowMs(), tasks = list, gifts = gifts, got = got };
+            return new Msg { from = Cfg.clientId, name = Cfg.name, type = type, text = text, time = Util.NowMs(), tasks = list, gifts = gifts, got = got, ver = Program.Version };
         }
 
         static string Short(string s, int n) { return s.Length > n ? s.Substring(0, n) + "…" : s; }
@@ -1004,6 +1040,7 @@ namespace FriendlyFire
                     }
             bool fresh = time > Cfg.lastSeen;   // not shown before (messages are replayed after a restart)
             if (fresh) Cfg.lastSeen = time;
+            FollowVersion(m.ver, fresh);
             Save();
             main.FillTheirs();
             MarkSeen(false);
@@ -1087,6 +1124,25 @@ namespace FriendlyFire
             HideFriend(t);
             Save();
             main.FillTheirs();
+        }
+
+        // Both PCs stay on the same version: when the friend runs a newer one, update (and restart) right away;
+        // when theirs is older, send my list again so they see my version (ntfy keeps it for them if they're off)
+        DateTime followedAt = DateTime.MinValue, nudgedAt = DateTime.MinValue;
+        void FollowVersion(string ver, bool fresh)
+        {
+            Version theirs, mine = new Version(Program.Version);
+            if (string.IsNullOrEmpty(ver) || !Version.TryParse(ver, out theirs)) return;
+            if (theirs > mine && (!testCopy || Program.FollowUpdates) && DateTime.Now - followedAt > TimeSpan.FromMinutes(10))
+            {
+                followedAt = DateTime.Now;
+                CheckUpdate(false);
+            }
+            else if (theirs < mine && fresh && DateTime.Now - nudgedAt > TimeSpan.FromMinutes(10))
+            {
+                nudgedAt = DateTime.Now;
+                relay.Publish(Make("sync", null));
+            }
         }
 
         void ShowMain()
@@ -1221,14 +1277,19 @@ namespace FriendlyFire
 
     static class Program
     {
-        public const string Version = "1.0.4";
+        public const string Version = "1.0.5";
         public static Icon Flame;
         static Mutex mutex;
         public static string RestartArgs = "";   // the same -Data/-Name/-Code after an update
         public static bool CheckNow;              // -CheckUpdate: look for an update right away (also in test copies)
+        public static bool FollowUpdates;         // -FollowUpdates: a test copy also updates when the friend runs a newer version
 
         // Shown in Settings → บันทึกการอัปเดต (newest first; add a line with each release)
         public const string Changelog =
+            "v1.0.5\n" +
+            "• อัปเดตพร้อมกันสองฝั่ง: พอเครื่องหนึ่งอัปเดต อีกเครื่องจะอัปเดตและเปิดใหม่ทันที (ถ้าปิดเครื่องอยู่ จะอัปเดตทันทีที่เปิดแอป)\n" +
+            "• ตรวจอัปเดตทันทีตอนเปิดแอป และทุก 1 ชั่วโมง\n" +
+            "• รีแอคชันตั้งต้น: 🔥 😎 👍 ❓ และเลือกปุ่มรีแอคชันเองได้ในตั้งค่า\n\n" +
             "v1.0.4\n" +
             "• เอาเมาส์ไปชี้ที่การแจ้งเตือน จะเห็นปุ่ม 🔕 และ ✕ (ปกติซ่อนไว้)\n" +
             "• 🔕 ปิดการแจ้งเตือน 1 ชั่วโมง, 1 วัน หรือไม่แจ้งเตือนแบบนี้อีก (เปิดคืนได้ในตั้งค่า)\n" +
@@ -1274,6 +1335,7 @@ namespace FriendlyFire
                 else if (a == "--updated") updated = true;
                 else if (a == "--restart") restarted = true;
                 else if (a == "-checkupdate") CheckNow = true;
+                else if (a == "-followupdates") FollowUpdates = true;
             }
             foreach (string x in args) if (x != "--updated" && x != "--restart") RestartArgs += "\"" + x + "\" ";
             bool testCopy = dataDir != null;
