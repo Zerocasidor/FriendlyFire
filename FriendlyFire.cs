@@ -52,6 +52,7 @@ namespace FriendlyFire
         public bool notifyAll = true;                            // pop-ups at all
         public bool notifySound = true;
         public List<string> notifyOff = new List<string> { "accept", "reject" };   // kinds turned off in Settings → ขั้นสูง
+        public long notifyMuteUntil;                             // unix s: all pop-ups paused until then (🔕 on a pop-up)
     }
 
     // One message on the topic. Every message carries the sender's task list, so the other side is always up to date.
@@ -245,13 +246,16 @@ namespace FriendlyFire
         static readonly Queue<Action> waiting = new Queue<Action>();
         static Notice current;
         public static Config Settings;   // which kinds may pop up, and the sound
+        public static Action SaveSettings;
+        public static readonly string[] Reactions = { "👍", "🔥", "😎", "❓" };
         protected override bool ShowWithoutActivation { get { return true; } }
+        static readonly Color Edge = Color.FromArgb(255, 170, 100), Paper = Color.FromArgb(255, 243, 230);
 
         // The kinds of pop-ups you can turn off in Settings (problems and answers to your own clicks always show)
         public static readonly string[][] Kinds =
         {
             new[] { "done",   "เพื่อนทำงานสำเร็จ" },
-            new[] { "react",  "เพื่อนส่งรีแอคชัน (🔥 👏 💪 😎) ให้" },
+            new[] { "react",  "เพื่อนส่งรีแอคชัน (👍 🔥 😎 ❓) ให้" },
             new[] { "gift",   "เพื่อนส่งงานให้" },
             new[] { "accept", "เพื่อนรับงานที่คุณส่ง" },
             new[] { "reject", "เพื่อนไม่รับงานที่คุณส่ง" },
@@ -259,17 +263,23 @@ namespace FriendlyFire
             new[] { "update", "แอปอัปเดตเป็นเวอร์ชันใหม่" },
         };
 
-        public static void Show(string kind, string title, string text, Action<string> react)
+        static string KindName(string kind) { foreach (var k in Kinds) if (k[0] == kind) return k[1]; return kind; }
+
+        public static bool Muted { get { return Settings != null && Settings.notifyMuteUntil > Util.NowSec(); } }
+
+        static bool Allowed(string kind)
         {
-            if (Settings != null && (!Settings.notifyAll || Settings.notifyOff.Contains(kind))) return;
-            Show(title, text, react);
+            return kind == null || Settings == null || (Settings.notifyAll && !Muted && !Settings.notifyOff.Contains(kind));
         }
 
-        public static void Show(string title, string text, Action<string> react)
+        public static void Show(string kind, string title, string text, Action<string> react)
         {
-            waiting.Enqueue(() => Open(title, text, react));
+            if (!Allowed(kind)) return;
+            waiting.Enqueue(() => { if (Allowed(kind)) Open(kind, title, text, react); else Next(); });   // muting from a pop-up also skips the ones waiting
             if (current == null || current.IsDisposed) Next();
         }
+
+        public static void Show(string title, string text, Action<string> react) { Show(null, title, text, react); }
 
         static void Next()
         {
@@ -277,13 +287,14 @@ namespace FriendlyFire
             if (waiting.Count > 0) waiting.Dequeue()();
         }
 
-        static void Open(string title, string text, Action<string> react)
+        static void Open(string kind, string title, string text, Action<string> react)
         {
             var f = current = new Notice
             {
-                Text = "Friendly Fire", TopMost = true, FormBorderStyle = FormBorderStyle.FixedToolWindow, ShowInTaskbar = false,
-                StartPosition = FormStartPosition.Manual, Font = Util.UiFont(10), BackColor = Color.FromArgb(255, 243, 230)
+                Text = "Friendly Fire", TopMost = true, FormBorderStyle = FormBorderStyle.None, ShowInTaskbar = false,
+                StartPosition = FormStartPosition.Manual, Font = Util.UiFont(10), BackColor = Paper
             };
+            f.Paint += (s, e) => { using (var p = new Pen(Edge)) e.Graphics.DrawRectangle(p, 0, 0, f.ClientSize.Width - 1, f.ClientSize.Height - 1); };
             var head = new Label { Text = title, Font = new Font("Segoe UI", 11, FontStyle.Bold), ForeColor = Color.FromArgb(190, 70, 0),
                                    Location = new Point(12, 10), AutoSize = true, MaximumSize = new Size(320, 0) };
             f.Controls.Add(head);
@@ -299,7 +310,7 @@ namespace FriendlyFire
             if (react != null)
             {
                 int x = 12;
-                foreach (string e in new[] { "🔥", "👏", "💪", "😎" })
+                foreach (string e in Reactions)
                 {
                     string emoji = e;
                     var b = new Button { Text = emoji, Font = Util.EmojiFont(13), Location = new Point(x, bottom + 8), Size = new Size(48, 38), FlatStyle = FlatStyle.Flat };
@@ -310,18 +321,43 @@ namespace FriendlyFire
                 bottom += 8 + 38;
                 right = Math.Max(right, x - 6);
             }
-            f.ClientSize = new Size(Math.Max(right + 12, 220), bottom + 12);
+            int width = Math.Max(right + 12 + 56, 240);   // room on the right for 🔕 and ✕
+            f.ClientSize = new Size(width, bottom + 12);
+
+            // 🔕 (mute) and ✕ (close): only while the mouse is over the pop-up
+            var close = TopButton("✕", width - 30);
+            close.Click += (s, e) => f.Close();
+            var mute = TopButton("🔕", width - 58);
+            var menu = new ContextMenuStrip { Font = Util.UiFont(10) };
+            menu.Items.Add("ปิดการแจ้งเตือน 1 ชั่วโมง", null, (s, e) => { MuteFor(3600); f.Close(); });
+            menu.Items.Add("ปิดการแจ้งเตือน 1 วัน", null, (s, e) => { MuteFor(86400); f.Close(); });
+            if (kind != null)
+                menu.Items.Add("ไม่แจ้งเตือนแบบนี้อีก (" + KindName(kind) + ")", null, (s, e) =>
+                {
+                    if (!Settings.notifyOff.Contains(kind)) Settings.notifyOff.Add(kind);
+                    if (SaveSettings != null) SaveSettings();
+                    f.Close();
+                });
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add(new ToolStripMenuItem("(เปิดคืนได้ใน ⚙ ตั้งค่า)") { Enabled = false });
+            mute.Click += (s, e) => menu.Show(mute, new Point(0, mute.Height));
+            f.Controls.Add(close); f.Controls.Add(mute);
+            close.BringToFront(); mute.BringToFront();
+            close.Visible = false; mute.Visible = false;
+
             Rectangle wa = Screen.PrimaryScreen.WorkingArea;
             f.Location = new Point(wa.Right - f.Width - 12, wa.Bottom - f.Height - 12);
-            f.FormClosed += (s, e) => Next();
+            f.FormClosed += (s, e) => { menu.Dispose(); Next(); };
 
-            // Stay 12 s (longer with reaction buttons), then fade out over the last second
+            // Stay 8 s (20 s with reaction buttons), then fade out over the last second; hovering (or the mute menu) keeps it
             DateTime fadeAt = DateTime.Now.AddSeconds(react != null ? 20 : 8);
             var t = new System.Windows.Forms.Timer { Interval = 50 };
             t.Tick += (s, e) =>
             {
                 if (f.IsDisposed) { t.Dispose(); return; }
-                if (f.Bounds.Contains(Cursor.Position)) { fadeAt = DateTime.Now.AddSeconds(3); f.Opacity = 1; return; }   // hovering keeps it
+                bool over = f.Bounds.Contains(Cursor.Position) || menu.Visible;
+                close.Visible = over; mute.Visible = over && Settings != null;
+                if (over) { fadeAt = DateTime.Now.AddSeconds(3); f.Opacity = 1; return; }
                 double into = (DateTime.Now - fadeAt).TotalSeconds;
                 if (into < 0) return;
                 if (into >= 1) { t.Dispose(); f.Close(); return; }
@@ -330,6 +366,21 @@ namespace FriendlyFire
             t.Start();
             f.Show();
             PlaySound();
+        }
+
+        static Label TopButton(string text, int x)
+        {
+            var b = new Label { Text = text, Font = Util.EmojiFont(10), ForeColor = Color.DimGray, TextAlign = System.Drawing.ContentAlignment.MiddleCenter,
+                                Location = new Point(x, 4), Size = new Size(26, 24), Cursor = Cursors.Hand };
+            b.MouseEnter += (s, e) => b.BackColor = Color.FromArgb(255, 220, 190);
+            b.MouseLeave += (s, e) => b.BackColor = Color.Transparent;
+            return b;
+        }
+
+        static void MuteFor(int seconds)
+        {
+            Settings.notifyMuteUntil = Util.NowSec() + seconds;
+            if (SaveSettings != null) SaveSettings();
         }
 
         static void PlaySound()
@@ -751,7 +802,16 @@ namespace FriendlyFire
             sound.CheckedChanged += (s, e) => { cfg.notifySound = sound.Checked; app.Save(); };
             more.LinkClicked += (s, e) => { kinds.Visible = !kinds.Visible; more.Text = kinds.Visible ? "ขั้นสูง ▾" : "ขั้นสูง ▸"; };
             enable();
-            page.Controls.AddRange(new Control[] { all, sound, more, kinds });
+            // Paused from a pop-up (🔕): say until when, with a way to turn it back on
+            var paused = new LinkLabel { AutoSize = true, Margin = new Padding(3, 2, 3, 2), Visible = Notice.Muted };
+            if (Notice.Muted)
+            {
+                string until = Util.Local(cfg.notifyMuteUntil).ToString(Util.Local(cfg.notifyMuteUntil).Date == DateTime.Today ? "HH:mm" : "d/M HH:mm", CultureInfo.InvariantCulture);
+                paused.Text = "🔕 ปิดการแจ้งเตือนชั่วคราวถึง " + until + "   เปิดตอนนี้";
+                paused.LinkArea = new LinkArea(paused.Text.Length - "เปิดตอนนี้".Length, "เปิดตอนนี้".Length);
+                paused.LinkClicked += (s, e) => { cfg.notifyMuteUntil = 0; app.Save(); paused.Visible = false; };
+            }
+            page.Controls.AddRange(new Control[] { all, paused, sound, more, kinds });
 
             page.Controls.Add(heading("ทั่วไป"));
             var start = new CheckBox { Text = "เปิดพร้อม Windows", Checked = cfg.startWithWindows, AutoSize = true, Enabled = !app.TestCopy };
@@ -824,6 +884,7 @@ namespace FriendlyFire
             }
             Save();
             Notice.Settings = Cfg;
+            Notice.SaveSettings = Save;
 
             main = new MainForm(this);
             relay = new Relay("friendlyfire-" + Cfg.code.ToLowerInvariant(), Cfg.clientId);
@@ -1160,7 +1221,7 @@ namespace FriendlyFire
 
     static class Program
     {
-        public const string Version = "1.0.3";
+        public const string Version = "1.0.4";
         public static Icon Flame;
         static Mutex mutex;
         public static string RestartArgs = "";   // the same -Data/-Name/-Code after an update
@@ -1168,6 +1229,10 @@ namespace FriendlyFire
 
         // Shown in Settings → บันทึกการอัปเดต (newest first; add a line with each release)
         public const string Changelog =
+            "v1.0.4\n" +
+            "• เอาเมาส์ไปชี้ที่การแจ้งเตือน จะเห็นปุ่ม 🔕 และ ✕ (ปกติซ่อนไว้)\n" +
+            "• 🔕 ปิดการแจ้งเตือน 1 ชั่วโมง, 1 วัน หรือไม่แจ้งเตือนแบบนี้อีก (เปิดคืนได้ในตั้งค่า)\n" +
+            "• รีแอคชันใหม่: 👍 🔥 😎 ❓\n\n" +
             "v1.0.3\n" +
             "• ปุ่ม ⚙ ตั้งค่า: เปิด/ปิดการแจ้งเตือนทั้งหมด เปิด/ปิดเสียง และเลือกทีละอย่างใน \"ขั้นสูง\"\n" +
             "• ดูบันทึกการอัปเดตได้ในหน้าตั้งค่า\n" +
