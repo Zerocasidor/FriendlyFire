@@ -29,6 +29,7 @@ namespace FriendlyFire
         public string text;
         public bool done;
         public long doneAt;   // unix seconds
+        public long seenAt;   // this PC only: when a finished task was seen here; it goes away 24 h later
         public override string ToString() { return text; }
     }
 
@@ -43,6 +44,7 @@ namespace FriendlyFire
         public long friendTasksTime;          // Msg.time of the friend's list we have
         public List<TaskItem> tasks = new List<TaskItem>();
         public List<TaskItem> friendTasks = new List<TaskItem>();
+        public List<string> friendHidden = new List<string>();   // friend's tasks removed on this PC (don't bring them back)
     }
 
     // One message on the topic. Every message carries the sender's task list, so the other side is always up to date.
@@ -403,10 +405,17 @@ namespace FriendlyFire
             mine.MouseDown += (s, e) => { if (e.Button == MouseButtons.Right) { int i = mine.IndexFromPoint(e.Location); if (i >= 0) mine.SelectedIndex = i; } };
             myBox.Controls.Add(mine); myBox.Controls.Add(addRow);
 
-            // Friend's tasks: read only
+            // Friend's tasks: read only; finished ones can be removed from this PC
             theirBox.Dock = DockStyle.Fill; theirBox.Padding = new Padding(8);
-            theirs.Dock = DockStyle.Fill; theirs.IntegralHeight = false; theirs.BorderStyle = BorderStyle.None; theirs.SelectionMode = SelectionMode.None;
+            theirs.Dock = DockStyle.Fill; theirs.IntegralHeight = false; theirs.BorderStyle = BorderStyle.None;
+            var theirMenu = new ContextMenuStrip();
+            theirMenu.Items.Add("ลบงานนี้ (เฉพาะเครื่องนี้)", null, (s, e) => { var t = TheirSelected(); if (t != null) app.HideFriendTask(t); });
+            theirMenu.Opening += (s, e) => { var t = TheirSelected(); e.Cancel = t == null || !t.done; };   // unfinished tasks belong to the friend
+            theirs.ContextMenuStrip = theirMenu;
+            theirs.MouseDown += (s, e) => { if (e.Button == MouseButtons.Right) { int i = theirs.IndexFromPoint(e.Location); if (i >= 0) theirs.SelectedIndex = i; } };
+            theirs.KeyDown += (s, e) => { var t = TheirSelected(); if (e.KeyCode == Keys.Delete && t != null && t.done) app.HideFriendTask(t); };
             theirBox.Controls.Add(theirs);
+            Activated += (s, e) => app.MarkSeen(true);
 
             grid.Controls.Add(myBox, 0, 0); grid.Controls.Add(theirBox, 1, 0);
             Controls.Add(grid); Controls.Add(bottom); Controls.Add(status);
@@ -444,6 +453,7 @@ namespace FriendlyFire
             var t = (TaskItem)mine.Items[e.Index];
             t.done = e.NewValue == CheckState.Checked;
             t.doneAt = t.done ? Util.NowSec() : 0;
+            t.seenAt = t.doneAt;   // you saw it when you ticked it
             // After this event the box has its new state; send once it's applied
             BeginInvoke((Action)(() => app.Changed(t.done ? "done" : "sync", t.done ? t.text : null)));
         }
@@ -472,12 +482,20 @@ namespace FriendlyFire
             theirBox.Text = "งานของ " + app.FriendLabel;
             theirs.BeginUpdate();
             theirs.Items.Clear();
-            // Finished tasks stay for 1 day (also when the friend's PC has been off since)
-            var shown = app.Cfg.friendTasks.Where(t => !t.done || t.doneAt > Util.NowSec() - 86400).ToList();
-            foreach (var t in shown) theirs.Items.Add((t.done ? "✓  " : "○  ") + t.text);
-            if (shown.Count == 0) theirs.Items.Add(app.Cfg.friendName == "" ? "(รอเพื่อนเข้าร่วม...)" : "(ยังไม่มีงาน)");
+            theirShown = app.Cfg.friendTasks.ToList();
+            foreach (var t in theirShown) theirs.Items.Add((t.done ? "✓  " : "○  ") + t.text);
+            if (theirShown.Count == 0) theirs.Items.Add(app.Cfg.friendName == "" ? "(รอเพื่อนเข้าร่วม...)" : "(ยังไม่มีงาน)");
             theirs.EndUpdate();
         }
+
+        List<TaskItem> theirShown = new List<TaskItem>();
+        TaskItem TheirSelected()
+        {
+            int i = theirs.SelectedIndex;
+            return i >= 0 && i < theirShown.Count ? theirShown[i] : null;
+        }
+
+        public bool Watching { get { return Visible && WindowState != FormWindowState.Minimized && Form.ActiveForm == this; } }
 
         public void SetStatus(bool online)
         {
@@ -503,7 +521,8 @@ namespace FriendlyFire
         readonly MainForm main;
         readonly Relay relay;
         readonly Control ui = new Control();
-        readonly System.Windows.Forms.Timer syncTimer = new System.Windows.Forms.Timer(), updateTimer = new System.Windows.Forms.Timer();
+        readonly System.Windows.Forms.Timer syncTimer = new System.Windows.Forms.Timer(), updateTimer = new System.Windows.Forms.Timer(),
+                                            tidyTimer = new System.Windows.Forms.Timer();
         bool updating;
 
         public string FriendLabel { get { return Cfg.friendName == "" ? "เพื่อน" : Cfg.friendName; } }
@@ -557,6 +576,11 @@ namespace FriendlyFire
             syncTimer.Interval = 6 * 3600 * 1000;
             syncTimer.Tick += (s, e) => relay.Publish(Make("sync", null));
             syncTimer.Start();
+            // Every minute: note what's on screen, remove finished tasks seen more than a day ago
+            tidyTimer.Interval = 60 * 1000;
+            tidyTimer.Tick += (s, e) => { MarkSeen(false); Tidy(); };
+            tidyTimer.Start();
+            Tidy();
             if (!testCopy)
             {
                 Updater.CleanUp();
@@ -573,10 +597,8 @@ namespace FriendlyFire
 
         public Msg Make(string type, string text)
         {
-            // Unfinished tasks + those finished in the last day (the friend sees a finished task for 1 day)
-            long cutoff = Util.NowSec() - 86400;
-            var list = Cfg.tasks.Where(t => !t.done || t.doneAt > cutoff)
-                                .Select(t => new TaskItem { id = t.id, text = t.text.Length > 80 ? t.text.Substring(0, 80) + "…" : t.text, done = t.done, doneAt = t.doneAt })
+            // All my tasks (seenAt stays on this PC: the friend's PC decides when a finished task goes away there)
+            var list = Cfg.tasks.Select(t => new TaskItem { id = t.id, text = t.text.Length > 80 ? t.text.Substring(0, 80) + "…" : t.text, done = t.done, doneAt = t.doneAt })
                                 .ToList();
             return new Msg { from = Cfg.clientId, name = Cfg.name, type = type, text = text, time = Util.NowMs(), tasks = list };
         }
@@ -592,11 +614,12 @@ namespace FriendlyFire
         void OnMessage(Msg m, long time)
         {
             if (!string.IsNullOrEmpty(m.name)) Cfg.friendName = m.name;
-            if (m.tasks != null && m.time >= Cfg.friendTasksTime) { Cfg.friendTasks = m.tasks; Cfg.friendTasksTime = m.time; }
+            if (m.tasks != null && m.time >= Cfg.friendTasksTime) { MergeFriend(m.tasks); Cfg.friendTasksTime = m.time; }
             bool fresh = time > Cfg.lastSeen;   // not shown before (messages are replayed after a restart)
             if (fresh) Cfg.lastSeen = time;
             Save();
             main.FillTheirs();
+            MarkSeen(false);
             main.SetStatus(true);
             if (!fresh) return;
 
@@ -611,6 +634,64 @@ namespace FriendlyFire
                 Notice.Show(FriendLabel + " ส่ง " + m.text + " ให้คุณ" + when, null, null);
         }
 
+        // The friend's new list, but finished tasks stay here until they've been seen for a day (or removed here)
+        void MergeFriend(List<TaskItem> snap)
+        {
+            var old = new Dictionary<string, TaskItem>();
+            foreach (var t in Cfg.friendTasks) old[t.id] = t;
+            var ids = new HashSet<string>();
+            var list = new List<TaskItem>();
+            foreach (var t in snap)
+            {
+                if (t.id == null || !ids.Add(t.id)) continue;
+                if (t.done && Cfg.friendHidden.Contains(t.id)) continue;
+                if (!t.done) Cfg.friendHidden.Remove(t.id);   // unticked again: show it again
+                TaskItem o;
+                t.seenAt = old.TryGetValue(t.id, out o) && o.done == t.done ? o.seenAt : 0;
+                list.Add(t);
+            }
+            // Finished tasks the friend deleted (or an older version stopped sending) stay until they expire here
+            foreach (var o in Cfg.friendTasks) if (o.done && !ids.Contains(o.id)) list.Add(o);
+            Cfg.friendTasks = list;
+        }
+
+        // Finished friend tasks count as read once the window is open in front of you
+        public void MarkSeen(bool active)
+        {
+            if (!active && !main.Watching) return;
+            bool changed = false;
+            foreach (var t in Cfg.friendTasks) if (t.done && t.seenAt == 0) { t.seenAt = Util.NowSec(); changed = true; }
+            if (changed) Save();
+        }
+
+        // Remove finished tasks a day after they were seen on this PC
+        void Tidy()
+        {
+            long cutoff = Util.NowSec() - 86400;
+            foreach (var t in Cfg.tasks) if (t.done && t.seenAt == 0) t.seenAt = t.doneAt;   // from v1.0.0
+            int mineGone = Cfg.tasks.RemoveAll(t => t.done && t.seenAt < cutoff);
+            var expired = Cfg.friendTasks.Where(t => t.done && t.seenAt > 0 && t.seenAt < cutoff).ToList();
+            foreach (var t in expired) HideFriend(t);
+            if (mineGone == 0 && expired.Count == 0) return;
+            Save();
+            if (mineGone > 0) main.FillMine();
+            if (expired.Count > 0) main.FillTheirs();
+        }
+
+        void HideFriend(TaskItem t)
+        {
+            Cfg.friendTasks.Remove(t);
+            if (!Cfg.friendHidden.Contains(t.id)) Cfg.friendHidden.Add(t.id);
+            if (Cfg.friendHidden.Count > 300) Cfg.friendHidden.RemoveRange(0, Cfg.friendHidden.Count - 300);
+        }
+
+        public void HideFriendTask(TaskItem t)
+        {
+            HideFriend(t);
+            Save();
+            main.FillTheirs();
+        }
+
         void ShowMain()
         {
             main.Show();
@@ -621,16 +702,48 @@ namespace FriendlyFire
         void ShowCode()
         {
             var f = new Form { Text = "รหัสเชิญ", FormBorderStyle = FormBorderStyle.FixedDialog, MaximizeBox = false, MinimizeBox = false, Icon = Program.Flame,
-                               StartPosition = FormStartPosition.CenterScreen, ClientSize = new Size(400, 170), Font = Util.UiFont(10.5f), TopMost = true };
+                               StartPosition = FormStartPosition.CenterScreen, ClientSize = new Size(400, 290), Font = Util.UiFont(10.5f), TopMost = true };
             f.Controls.Add(new Label { Text = "ส่งรหัสนี้ให้เพื่อน แล้วให้เพื่อนเลือก \"ใส่รหัสเชิญจากเพื่อน\"\r\n(ใครมีรหัสนี้จะเห็นงานของคุณ ส่งให้เพื่อนคนเดียวพอ)",
                                        Location = new Point(16, 14), Size = new Size(370, 50) });
             var box = new TextBox { Text = Cfg.code, ReadOnly = true, Font = new Font("Consolas", 14), Location = new Point(16, 70), Width = 260 };
             var copy = new Button { Text = "คัดลอก", Location = new Point(284, 68), Size = new Size(100, 34) };
             copy.Click += (s, e) => { Clipboard.SetText(Cfg.code); copy.Text = "คัดลอกแล้ว ✓"; };
-            var ok = new Button { Text = "ปิด", Location = new Point(284, 120), Size = new Size(100, 34), DialogResult = DialogResult.OK };
-            f.Controls.AddRange(new Control[] { box, copy, ok });
-            f.AcceptButton = ok;
+
+            // Both made a pair? One of you enters the other's code here
+            f.Controls.Add(new Label { Text = "หรือ ใส่รหัสเชิญจากเพื่อน (ถ้าต่างคนต่างสร้างคู่):", Location = new Point(16, 124), Size = new Size(370, 24) });
+            var join = new TextBox { Font = new Font("Consolas", 14), Location = new Point(16, 152), Width = 260 };
+            var joinBtn = new Button { Text = "เข้าร่วม", Location = new Point(284, 150), Size = new Size(100, 34) };
+            var note = new Label { ForeColor = Color.Firebrick, Location = new Point(16, 192), Size = new Size(370, 24) };
+            joinBtn.Click += (s, e) =>
+            {
+                string c = Program.CleanCode(join.Text);
+                if (c == null) { note.Text = "รหัสไม่ถูกต้อง (หน้าตาแบบ FF-XXXXXXXXXXXXXXXX)"; return; }
+                if (c == Cfg.code) { note.Text = "นี่คือรหัสของคุณเอง ใส่รหัสของเพื่อน"; return; }
+                f.Close();
+                SwitchCode(c);
+            };
+            var ok = new Button { Text = "ปิด", Location = new Point(284, 240), Size = new Size(100, 34), DialogResult = DialogResult.OK };
+            ok.Click += (s, e) => f.Close();
+            f.Controls.AddRange(new Control[] { box, copy, join, joinBtn, note, ok });
+            f.AcceptButton = joinBtn;
             f.Show();
+        }
+
+        // Join the friend's pair instead: forget the old friend, then start again on the new channel
+        void SwitchCode(string code)
+        {
+            Cfg.code = code;
+            Cfg.friendName = "";
+            Cfg.friendTasks.Clear();
+            Cfg.friendHidden.Clear();
+            Cfg.friendTasksTime = 0;
+            Cfg.lastSeen = Util.NowSec();   // no pop-ups for what the friend did before we joined
+            Save();
+            relay.Stop();
+            tray.Visible = false;
+            Program.ReleaseLock();
+            Process.Start(Application.ExecutablePath, Program.RestartArgs + " --restart");
+            ExitThread();
         }
 
         void ApplyStartup()
@@ -694,7 +807,7 @@ namespace FriendlyFire
 
     static class Program
     {
-        public const string Version = "1.0.0";
+        public const string Version = "1.0.1";
         public static Icon Flame;
         static Mutex mutex;
         public static string RestartArgs = "";   // the same -Data/-Name/-Code after an update
@@ -717,7 +830,7 @@ namespace FriendlyFire
             ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;   // ntfy.sh and GitHub need TLS 1.2
 
             string dataDir = null, name = null, code = null;
-            bool updated = false;
+            bool updated = false, restarted = false;
             for (int i = 0; i < args.Length; i++)
             {
                 string a = args[i].ToLowerInvariant();
@@ -725,9 +838,10 @@ namespace FriendlyFire
                 else if (a == "-name" && i + 1 < args.Length) name = args[++i];
                 else if (a == "-code" && i + 1 < args.Length) code = args[++i];
                 else if (a == "--updated") updated = true;
+                else if (a == "--restart") restarted = true;
                 else if (a == "-checkupdate") CheckNow = true;
             }
-            foreach (string x in args) if (x != "--updated") RestartArgs += "\"" + x + "\" ";
+            foreach (string x in args) if (x != "--updated" && x != "--restart") RestartArgs += "\"" + x + "\" ";
             bool testCopy = dataDir != null;
             if (dataDir == null) dataDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "FriendlyFire");
             dataDir = Path.GetFullPath(dataDir);
@@ -735,7 +849,7 @@ namespace FriendlyFire
             // One copy per data folder; after an update the new copy waits for the old one to exit
             bool owned;
             mutex = new Mutex(false, "FriendlyFire-" + dataDir.ToLowerInvariant().GetHashCode().ToString("x"), out owned);
-            try { if (!mutex.WaitOne(updated ? 20000 : 0)) return; }
+            try { if (!mutex.WaitOne(updated || restarted ? 20000 : 0)) return; }
             catch (AbandonedMutexException) { }   // the old copy was killed: the lock is ours now
 
             Application.EnableVisualStyles();
