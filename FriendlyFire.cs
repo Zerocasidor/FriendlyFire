@@ -249,8 +249,11 @@ namespace FriendlyFire
 
     class Notice : Form
     {
-        static readonly Queue<Action> waiting = new Queue<Action>();
+        // Pop-ups wait their turn; an exact repeat of one showing or waiting is dropped (spam), and ✕ clears the rest
+        class Pending { public string Key; public bool Keep; public Action Open; }
+        static readonly List<Pending> waiting = new List<Pending>();
         static Notice current;
+        static string currentKey;
         public static Config Settings;   // which kinds may pop up, and the sound
         public static Action SaveSettings;
         public static readonly string[] DefaultReactions = { "🔥", "😎", "👍", "❓" };
@@ -289,7 +292,9 @@ namespace FriendlyFire
         public static void Show(string kind, string title, string text, Action<string> react)
         {
             if (!Allowed(kind)) return;
-            waiting.Enqueue(() => { if (Allowed(kind)) Open(kind, title, text, react, null); else Next(); });   // muting from a pop-up also skips the ones waiting
+            string key = kind + "|" + title + "|" + text;
+            if ((key == currentKey && current != null && !current.IsDisposed) || waiting.Any(w => w.Key == key)) return;
+            waiting.Add(new Pending { Key = key, Open = () => { if (Allowed(kind)) Open(kind, title, text, react, null); else Next(); } });   // muting from a pop-up also skips the ones waiting
             if (current == null || current.IsDisposed) Next();
         }
 
@@ -298,14 +303,18 @@ namespace FriendlyFire
         // A pop-up with a "↩ เลิกทำ" button (always shown: it answers something you just did)
         public static void ShowUndo(string title, string text, Action undo)
         {
-            waiting.Enqueue(() => Open(null, title, text, null, undo));
+            waiting.Add(new Pending { Keep = true, Open = () => Open(null, title, text, null, undo) });   // ✕ never throws away an undo
             if (current == null || current.IsDisposed) Next();
         }
 
         static void Next()
         {
-            current = null;
-            if (waiting.Count > 0) waiting.Dequeue()();
+            current = null; currentKey = null;
+            if (waiting.Count == 0) return;
+            var p = waiting[0];
+            waiting.RemoveAt(0);
+            currentKey = p.Key;
+            p.Open();
         }
 
         // Where pop-ups go (Settings → ตำแหน่ง) and how big they are (Settings → ขนาด)
@@ -360,10 +369,13 @@ namespace FriendlyFire
             }
             int width = Math.Max(right + S(12) + S(56), S(240));   // room on the right for 🔕 and ✕
             f.ClientSize = new Size(width, bottom + S(12));
+            var more = new Label { ForeColor = Color.DimGray, Font = Util.UiFont(8.5f * z), TextAlign = System.Drawing.ContentAlignment.BottomRight,
+                                   Size = new Size(S(50), S(18)), Location = new Point(width - S(56), f.ClientSize.Height - S(22)), Visible = false };
+            f.Controls.Add(more);
 
             // 🔕 (mute) and ✕ (close): only while the mouse is over the pop-up
             var close = TopButton("✕", width - S(30), z);
-            close.Click += (s, e) => f.Close();
+            close.Click += (s, e) => { waiting.RemoveAll(w => !w.Keep); f.Close(); };   // one click closes the ones waiting too
             var mute = TopButton("🔕", width - S(58), z);
             var menu = new ContextMenuStrip { Font = Util.UiFont(10) };
             menu.Items.Add("ปิดการแจ้งเตือน 1 ชั่วโมง", null, (s, e) => { MuteFor(3600); f.Close(); });
@@ -401,6 +413,7 @@ namespace FriendlyFire
                 if (f.IsDisposed) { t.Dispose(); return; }
                 bool over = f.Bounds.Contains(Cursor.Position) || menu.Visible;
                 close.Visible = over; mute.Visible = over && Settings != null;
+                more.Text = "+" + waiting.Count + " รอ"; more.Visible = waiting.Count > 0;
                 if (over) { if (stay > 0) fadeAt = DateTime.Now.AddSeconds(3); f.Opacity = 1; return; }
                 double into = (DateTime.Now - fadeAt).TotalSeconds;
                 if (into < 0) return;
@@ -504,6 +517,7 @@ namespace FriendlyFire
         public bool ShowSelection;  // highlight the selected row (only while its right-click menu is open)
         const int TextLeft = 32, Btn = 26;
         const TextFormatFlags Wrap = TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl | TextFormatFlags.NoPrefix;
+        const TextFormatFlags Keep = TextFormatFlags.PreserveGraphicsTranslateTransform;   // rows are drawn into an off-screen buffer that is shifted
         static readonly Color Green = Color.FromArgb(40, 160, 70), Red = Color.FromArgb(215, 60, 50), Orange = Color.FromArgb(255, 140, 40);
         int lastWidth;
 
@@ -553,12 +567,21 @@ namespace FriendlyFire
         static readonly Color DoneBack = Color.FromArgb(236, 236, 236), GiftBack = Color.FromArgb(220, 244, 225),
                               WaitBack = Color.FromArgb(234, 234, 234), PickBack = Color.FromArgb(255, 222, 220), SelBack = Color.FromArgb(255, 238, 220);
 
+        // Each row is drawn off-screen first and then copied in one go, so it never shows half-drawn
         protected override void OnDrawItem(DrawItemEventArgs e)
         {
             if (e.Index < 0 || e.Index >= Rows.Count) return;
+            using (var buf = BufferedGraphicsManager.Current.Allocate(e.Graphics, e.Bounds))
+            {
+                DrawRow(buf.Graphics, e);
+                buf.Render(e.Graphics);
+            }
+        }
+
+        void DrawRow(Graphics g, DrawItemEventArgs e)
+        {
             var r = Rows[e.Index];
             var b = e.Bounds;
-            var g = e.Graphics;
             bool sel = ShowSelection && (e.State & DrawItemState.Selected) != 0 && r.task != null;
             bool picked = Picked == e.Index, lifted = r.task != null && (picked || Hot == e.Index);
             Color back = picked ? (PickedOut ? Color.FromArgb(255, 200, 195) : PickBack) : sel ? SelBack : r.buttons ? GiftBack : r.grey ? WaitBack : r.task != null && r.task.done ? DoneBack : BackColor;
@@ -591,16 +614,16 @@ namespace FriendlyFire
             if (r.check)
                 CheckBoxRenderer.DrawCheckBox(g, new Point(b.X + 9, top + 10), r.task.done ? CheckBoxState.CheckedNormal : CheckBoxState.UncheckedNormal);
             else if (r.task != null && !r.buttons)
-                TextRenderer.DrawText(g, r.task.done ? "✓" : "○", Font, new Rectangle(b.X + 4, lineY, 26, 22), r.task.done ? Green : Color.Gray, TextFormatFlags.HorizontalCenter | TextFormatFlags.NoPrefix);
+                TextRenderer.DrawText(g, r.task.done ? "✓" : "○", Font, new Rectangle(b.X + 4, lineY, 26, 22), r.task.done ? Green : Color.Gray, TextFormatFlags.HorizontalCenter | TextFormatFlags.NoPrefix | Keep);
             else if (r.buttons)
-                TextRenderer.DrawText(g, "🎁", Font, new Rectangle(b.X + 4, lineY, 26, 22), Green, TextFormatFlags.HorizontalCenter | TextFormatFlags.NoPrefix);
+                TextRenderer.DrawText(g, "🎁", Font, new Rectangle(b.X + 4, lineY, 26, 22), Green, TextFormatFlags.HorizontalCenter | TextFormatFlags.NoPrefix | Keep);
 
             Color fore = r.task == null || r.grey || r.task.done ? Color.Gray : r.buttons ? Color.FromArgb(25, 110, 45) : ForeColor;
-            TextRenderer.DrawText(g, r.text, Font, new Rectangle(b.X + TextLeft, lineY, TextWidth(r), b.Height - 6), fore, Wrap);
+            TextRenderer.DrawText(g, r.text, Font, new Rectangle(b.X + TextLeft, lineY, TextWidth(r), b.Height - 6), fore, Wrap | Keep);
 
             if (r.tag != null)
                 using (var small = Util.UiFont(8.5f))
-                    TextRenderer.DrawText(g, r.tag, small, new Rectangle(b.Right - 68, lineY + 2, 62, 20), Color.DimGray, TextFormatFlags.Right | TextFormatFlags.NoPrefix);
+                    TextRenderer.DrawText(g, r.tag, small, new Rectangle(b.Right - 68, lineY + 2, 62, 20), Color.DimGray, TextFormatFlags.Right | TextFormatFlags.NoPrefix | Keep);
 
             if (r.buttons)
             {
@@ -617,7 +640,7 @@ namespace FriendlyFire
                 {
                     var pill = new Rectangle(b.Right - 118, top + 4, 108, 22);
                     using (var br = new SolidBrush(Red)) g.FillRectangle(br, pill);
-                    TextRenderer.DrawText(g, "ปล่อยเพื่อทิ้ง 🗑", small, pill, Color.White, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                    TextRenderer.DrawText(g, "ปล่อยเพื่อทิ้ง 🗑", small, pill, Color.White, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | Keep);
                 }
 
             if (DropLine == e.Index || (DropLine == Rows.Count && e.Index == Rows.Count - 1))
@@ -675,7 +698,29 @@ namespace FriendlyFire
             return p.Y > b.Y + b.Height / 2 ? i + 1 : i;
         }
 
-        public void ShowDropLine(int i) { if (DropLine != i) { DropLine = i; Invalidate(); } }
+        // Redraw only the rows the line leaves and enters (redrawing the whole list made it flicker while dragging)
+        public void ShowDropLine(int i)
+        {
+            if (DropLine == i) return;
+            int old = DropLine; DropLine = i;
+            foreach (int k in new[] { old, old - 1, i, i - 1 }) Redraw(k);
+        }
+
+        // The list doesn't wipe rows white before they are drawn (that flash was the flicker): rows paint their own
+        // background, so only the space under the last row is filled here
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == 0x14)   // WM_ERASEBKGND
+            {
+                int bottom = Items.Count > 0 ? GetItemRectangle(Items.Count - 1).Bottom : 0;
+                if (bottom < ClientSize.Height)
+                    using (var g = Graphics.FromHdc(m.WParam))
+                    using (var br = new SolidBrush(BackColor)) g.FillRectangle(br, 0, bottom, ClientSize.Width, ClientSize.Height - bottom);
+                m.Result = (IntPtr)1;
+                return;
+            }
+            base.WndProc(ref m);
+        }
 
         protected override void OnMouseMove(MouseEventArgs e)
         {
@@ -1476,7 +1521,7 @@ namespace FriendlyFire
 
     static class Program
     {
-        public const string Version = "1.0.7";
+        public const string Version = "1.0.8";
         public static Icon Flame;
         static Mutex mutex;
         public static string RestartArgs = "";   // the same -Data/-Name/-Code after an update
@@ -1486,6 +1531,9 @@ namespace FriendlyFire
         // Shown in Settings → บันทึกการอัปเดต (newest first; add a line with each release)
         public const string Changelog =
             "-----29/10/2569-----\n" +
+            "v1.0.8\n" +
+            "• แก้ภาพกระพริบตอนลากงานผ่านงานอื่น\n" +
+            "• ป๊อปอัปที่ซ้ำกัน (กดรัว ๆ) ขึ้นแค่ครั้งเดียว และกด ✕ ครั้งเดียวปิดป๊อปอัปที่รอคิวอยู่ทั้งหมด (มีบอก +N รอ)\n\n" +
             "v1.0.7\n" +
             "• ชี้เมาส์ที่งานแล้วงานยกขึ้นเล็กน้อย, งานที่ลากอยู่มีสีแดงอ่อน\n" +
             "• งานที่เสร็จเป็นสีเทา, งานที่เพื่อนส่งมาเป็นสีเขียว\n" +
