@@ -461,6 +461,7 @@ namespace FriendlyFire
     {
         public List<Row> Rows = new List<Row>();
         public int DropLine = -1;   // where a dragged task would land, -1 = not dragging here
+        public bool ShowSelection;  // highlight the selected row (only while its right-click menu is open)
         const int TextLeft = 32, Btn = 26;
         const TextFormatFlags Wrap = TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl | TextFormatFlags.NoPrefix;
         static readonly Color Green = Color.FromArgb(40, 160, 70), Red = Color.FromArgb(215, 60, 50), Orange = Color.FromArgb(255, 140, 40);
@@ -499,6 +500,9 @@ namespace FriendlyFire
             e.ItemHeight = Math.Min(255, Math.Max(Btn + 8, h + 12));
         }
 
+        // Only a click inside the tick box ticks (a click elsewhere on the row is easy to make by mistake)
+        public Rectangle CheckRect(int i) { var b = GetItemRectangle(i); return new Rectangle(b.X + 5, b.Y + 6, 22, 22); }
+
         public Rectangle OkRect(int i) { var b = GetItemRectangle(i); return new Rectangle(b.Right - 2 * Btn - 12, b.Y + 4, Btn, Btn); }
         public Rectangle NoRect(int i) { var b = GetItemRectangle(i); return new Rectangle(b.Right - Btn - 6, b.Y + 4, Btn, Btn); }
 
@@ -508,13 +512,13 @@ namespace FriendlyFire
             var r = Rows[e.Index];
             var b = e.Bounds;
             var g = e.Graphics;
-            bool sel = (e.State & DrawItemState.Selected) != 0 && r.task != null;
+            bool sel = ShowSelection && (e.State & DrawItemState.Selected) != 0 && r.task != null;
             Color back = r.grey ? Color.FromArgb(234, 234, 234) : sel ? Color.FromArgb(255, 238, 220) : BackColor;
             using (var br = new SolidBrush(back)) g.FillRectangle(br, b);
 
             int lineY = b.Y + 6;   // the first text line; marks and buttons line up with it
             if (r.check)
-                CheckBoxRenderer.DrawCheckBox(g, new Point(b.X + 9, lineY + 2), r.task.done ? CheckBoxState.CheckedNormal : CheckBoxState.UncheckedNormal);
+                CheckBoxRenderer.DrawCheckBox(g, new Point(b.X + 9, b.Y + 10), r.task.done ? CheckBoxState.CheckedNormal : CheckBoxState.UncheckedNormal);
             else if (r.task != null && !r.buttons)
                 TextRenderer.DrawText(g, r.task.done ? "✓" : "○", Font, new Rectangle(b.X + 4, lineY, 26, 22), r.task.done ? Green : Color.Gray, TextFormatFlags.HorizontalCenter | TextFormatFlags.NoPrefix);
             else if (r.buttons)
@@ -567,6 +571,15 @@ namespace FriendlyFire
         }
 
         public void ShowDropLine(int i) { if (DropLine != i) { DropLine = i; Invalidate(); } }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            int i = IndexFromPoint(e.Location);
+            var r = i >= 0 && i < Rows.Count ? Rows[i] : null;
+            bool hot = r != null && ((r.check && CheckRect(i).Contains(e.Location)) || (r.buttons && (OkRect(i).Contains(e.Location) || NoRect(i).Contains(e.Location))));
+            Cursor = hot ? Cursors.Hand : Cursors.Default;
+        }
     }
 
     class MainForm : Form
@@ -618,13 +631,6 @@ namespace FriendlyFire
             mine.MouseDown += MineDown;
             mine.MouseMove += MineMove;
             mine.MouseUp += MineUp;
-            mine.KeyDown += (s, e) =>
-            {
-                var t = mine.SelectedTask;
-                if (t == null) return;
-                if (e.KeyCode == Keys.Delete) DeleteTask(t);
-                else if (e.KeyCode == Keys.Space && !t.offer) { e.SuppressKeyPress = true; Toggle(t); }
-            };
             mine.DragOver += (s, e) => { var t = Dragged(e); e.Effect = t != null ? DragDropEffects.Move : DragDropEffects.None; mine.ShowDropLine(t != null ? mine.DropIndexAt(new Point(e.X, e.Y)) : -1); };
             mine.DragLeave += (s, e) => mine.ShowDropLine(-1);
             mine.DragDrop += (s, e) =>
@@ -639,6 +645,8 @@ namespace FriendlyFire
             menu.Items.Add("ลบงานที่เสร็จแล้วทั้งหมด", null, (s, e) => { app.Cfg.tasks.RemoveAll(t => t.done); app.Changed("sync", null); });
             menu.Opening += (s, e) => { var t = mine.SelectedTask; e.Cancel = t != null && t.offer; };   // gifts have their own ✓ / ✗
             mine.ContextMenuStrip = menu;
+            menu.Opened += (s, e) => { mine.ShowSelection = true; mine.Invalidate(); };
+            menu.Closed += (s, e) => { mine.ShowSelection = false; mine.Invalidate(); };
             myBox.Controls.Add(mine); myBox.Controls.Add(addRow);
 
             // Friend's tasks: read only; finished ones can be removed from this PC; drop a task here to give it
@@ -648,8 +656,9 @@ namespace FriendlyFire
             theirMenu.Items.Add("ลบงานนี้ (เฉพาะเครื่องนี้)", null, (s, e) => { var t = theirs.SelectedTask; if (t != null) app.HideFriendTask(t); });
             theirMenu.Opening += (s, e) => { var t = theirs.SelectedTask; e.Cancel = t == null || !t.done; };   // unfinished tasks belong to the friend
             theirs.ContextMenuStrip = theirMenu;
+            theirMenu.Opened += (s, e) => { theirs.ShowSelection = true; theirs.Invalidate(); };
+            theirMenu.Closed += (s, e) => { theirs.ShowSelection = false; theirs.Invalidate(); };
             theirs.MouseDown += (s, e) => { if (e.Button == MouseButtons.Right) theirs.SelectAt(e.Location); };
-            theirs.KeyDown += (s, e) => { var t = theirs.SelectedTask; if (e.KeyCode == Keys.Delete && t != null && t.done) app.HideFriendTask(t); };
             theirs.DragOver += (s, e) =>
             {
                 var t = Dragged(e);
@@ -694,8 +703,10 @@ namespace FriendlyFire
             var t = mine.TaskAt(pressed);
             pressed = -1;
             if (t == null || t.offer) return;
+            mine.Capture = false;   // otherwise the list keeps moving its selection with the mouse
             mine.DoDragDrop(t, DragDropEffects.Move);
             mine.ShowDropLine(-1);
+            mine.ClearSelected();
             theirs.BackColor = SystemColors.Window;
         }
 
@@ -707,7 +718,7 @@ namespace FriendlyFire
             if (e.Button != MouseButtons.Left || i < 0 || mine.IndexFromPoint(e.Location) != i) return;
             var t = mine.TaskAt(i);
             if (t == null) return;
-            if (!t.offer) Toggle(t);
+            if (!t.offer) { if (mine.CheckRect(i).Contains(e.Location)) Toggle(t); }
             else if (mine.OkRect(i).Contains(e.Location)) app.TakeGift(t, true);
             else if (mine.NoRect(i).Contains(e.Location)) app.TakeGift(t, false);
         }
@@ -1277,7 +1288,7 @@ namespace FriendlyFire
 
     static class Program
     {
-        public const string Version = "1.0.5";
+        public const string Version = "1.0.6";
         public static Icon Flame;
         static Mutex mutex;
         public static string RestartArgs = "";   // the same -Data/-Name/-Code after an update
@@ -1286,6 +1297,9 @@ namespace FriendlyFire
 
         // Shown in Settings → บันทึกการอัปเดต (newest first; add a line with each release)
         public const string Changelog =
+            "v1.0.6\n" +
+            "• ติ๊กเสร็จได้เฉพาะตอนกดในช่องติ๊กเท่านั้น (กันเผลอกด)\n" +
+            "• แก้แถบสีค้างหลังลากงานแล้วปล่อย\n\n" +
             "v1.0.5\n" +
             "• อัปเดตพร้อมกันสองฝั่ง: พอเครื่องหนึ่งอัปเดต อีกเครื่องจะอัปเดตและเปิดใหม่ทันที (ถ้าปิดเครื่องอยู่ จะอัปเดตทันทีที่เปิดแอป)\n" +
             "• ตรวจอัปเดตทันทีตอนเปิดแอป และทุก 1 ชั่วโมง\n" +
