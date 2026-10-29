@@ -19,6 +19,7 @@ using System.Text;
 using System.Threading;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
+using System.Windows.Forms.VisualStyles;
 using Microsoft.Win32;
 
 namespace FriendlyFire
@@ -30,6 +31,7 @@ namespace FriendlyFire
         public bool done;
         public long doneAt;   // unix seconds
         public long seenAt;   // this PC only: when a finished task was seen here; it goes away 24 h later
+        public bool offer;    // given by the friend, waiting for ✓ (take it) or ✗ (throw it away)
         public override string ToString() { return text; }
     }
 
@@ -45,6 +47,8 @@ namespace FriendlyFire
         public List<TaskItem> tasks = new List<TaskItem>();
         public List<TaskItem> friendTasks = new List<TaskItem>();
         public List<string> friendHidden = new List<string>();   // friend's tasks removed on this PC (don't bring them back)
+        public List<TaskItem> giving = new List<TaskItem>();     // my tasks dragged to the friend, sent until their list shows them
+        public List<string> giftsDone = new List<string>();      // gifts from the friend already taken or thrown away here
     }
 
     // One message on the topic. Every message carries the sender's task list, so the other side is always up to date.
@@ -52,10 +56,12 @@ namespace FriendlyFire
     {
         public string from;    // clientId
         public string name;
-        public string type;    // sync | done | react
+        public string type;    // sync | done | react | give | accept | reject
         public string text;
         public long time;      // unix ms, newer lists replace older ones
         public List<TaskItem> tasks;
+        public List<TaskItem> gifts;   // tasks given to the receiver (sent again until they show up in the receiver's list)
+        public List<string> got;       // ids of gifts the sender has already handled
     }
 
     static class Util
@@ -355,21 +361,145 @@ namespace FriendlyFire
 
     // ---------- main window ----------
 
+    // One row of a TaskList
+    class Row
+    {
+        public TaskItem task;     // null: a hint like "(ยังไม่มีงาน)"
+        public string text;
+        public bool check;        // draw a tick box (my tasks)
+        public bool grey;         // grey cover: a gift not taken yet
+        public bool buttons;      // ✓ / ✗ buttons of a gift
+        public string tag;        // small note on the right, e.g. "รอรับ"
+    }
+
+    // A list whose rows wrap long text instead of running off the edge; draws tick boxes, gifts and the drop line itself
+    class TaskList : ListBox
+    {
+        public List<Row> Rows = new List<Row>();
+        public int DropLine = -1;   // where a dragged task would land, -1 = not dragging here
+        const int TextLeft = 32, Btn = 26;
+        const TextFormatFlags Wrap = TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl | TextFormatFlags.NoPrefix;
+        static readonly Color Green = Color.FromArgb(40, 160, 70), Red = Color.FromArgb(215, 60, 50), Orange = Color.FromArgb(255, 140, 40);
+        int lastWidth;
+
+        public TaskList()
+        {
+            DrawMode = DrawMode.OwnerDrawVariable; IntegralHeight = false; BorderStyle = BorderStyle.None;
+        }
+
+        public void SetRows(List<Row> rows)
+        {
+            int top = TopIndex;
+            Rows = rows;
+            BeginUpdate();
+            Items.Clear();
+            foreach (var r in rows) Items.Add(r);   // heights are measured as items are added
+            if (top < Items.Count) TopIndex = top;
+            EndUpdate();
+        }
+
+        // Row heights depend on the width: measure again when it changes
+        protected override void OnSizeChanged(EventArgs e)
+        {
+            base.OnSizeChanged(e);
+            if (IsHandleCreated && ClientSize.Width != lastWidth) { lastWidth = ClientSize.Width; SetRows(Rows); }
+        }
+
+        int TextWidth(Row r) { return Math.Max(60, ClientSize.Width - TextLeft - (r.buttons ? 2 * Btn + 16 : r.tag != null ? 70 : 8)); }
+
+        protected override void OnMeasureItem(MeasureItemEventArgs e)
+        {
+            if (e.Index < 0 || e.Index >= Rows.Count) return;
+            var r = Rows[e.Index];
+            int h = TextRenderer.MeasureText(r.text, Font, new Size(TextWidth(r), 10000), Wrap).Height;
+            e.ItemHeight = Math.Min(255, Math.Max(Btn + 8, h + 12));
+        }
+
+        public Rectangle OkRect(int i) { var b = GetItemRectangle(i); return new Rectangle(b.Right - 2 * Btn - 12, b.Y + 4, Btn, Btn); }
+        public Rectangle NoRect(int i) { var b = GetItemRectangle(i); return new Rectangle(b.Right - Btn - 6, b.Y + 4, Btn, Btn); }
+
+        protected override void OnDrawItem(DrawItemEventArgs e)
+        {
+            if (e.Index < 0 || e.Index >= Rows.Count) return;
+            var r = Rows[e.Index];
+            var b = e.Bounds;
+            var g = e.Graphics;
+            bool sel = (e.State & DrawItemState.Selected) != 0 && r.task != null;
+            Color back = r.grey ? Color.FromArgb(234, 234, 234) : sel ? Color.FromArgb(255, 238, 220) : BackColor;
+            using (var br = new SolidBrush(back)) g.FillRectangle(br, b);
+
+            int lineY = b.Y + 6;   // the first text line; marks and buttons line up with it
+            if (r.check)
+                CheckBoxRenderer.DrawCheckBox(g, new Point(b.X + 9, lineY + 2), r.task.done ? CheckBoxState.CheckedNormal : CheckBoxState.UncheckedNormal);
+            else if (r.task != null && !r.buttons)
+                TextRenderer.DrawText(g, r.task.done ? "✓" : "○", Font, new Rectangle(b.X + 4, lineY, 26, 22), r.task.done ? Green : Color.Gray, TextFormatFlags.HorizontalCenter | TextFormatFlags.NoPrefix);
+            else if (r.buttons)
+                TextRenderer.DrawText(g, "🎁", Font, new Rectangle(b.X + 4, lineY, 26, 22), Orange, TextFormatFlags.HorizontalCenter | TextFormatFlags.NoPrefix);
+
+            Color fore = r.task == null || r.grey || r.task.done ? Color.Gray : ForeColor;
+            TextRenderer.DrawText(g, r.text, Font, new Rectangle(b.X + TextLeft, lineY, TextWidth(r), b.Height - 6), fore, Wrap);
+
+            if (r.tag != null)
+                using (var small = Util.UiFont(8.5f))
+                    TextRenderer.DrawText(g, r.tag, small, new Rectangle(b.Right - 68, lineY + 2, 62, 20), Color.DimGray, TextFormatFlags.Right | TextFormatFlags.NoPrefix);
+
+            if (r.buttons)
+            {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                DrawButton(g, OkRect(e.Index), Green, true);
+                DrawButton(g, NoRect(e.Index), Red, false);
+                g.SmoothingMode = SmoothingMode.Default;
+            }
+
+            using (var p = new Pen(Color.FromArgb(238, 238, 238))) g.DrawLine(p, b.X + 6, b.Bottom - 1, b.Right - 6, b.Bottom - 1);
+            if (DropLine == e.Index || (DropLine == Rows.Count && e.Index == Rows.Count - 1))
+                using (var br = new SolidBrush(Orange)) g.FillRectangle(br, b.X + 2, DropLine == e.Index ? b.Y : b.Bottom - 3, b.Width - 4, 3);
+        }
+
+        static void DrawButton(Graphics g, Rectangle r, Color c, bool tick)
+        {
+            using (var br = new SolidBrush(c)) g.FillEllipse(br, r);
+            using (var p = new Pen(Color.White, 2.6f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+            {
+                float x = r.X, y = r.Y, s = r.Width;
+                if (tick) g.DrawLines(p, new[] { new PointF(x + s * 0.27f, y + s * 0.52f), new PointF(x + s * 0.44f, y + s * 0.68f), new PointF(x + s * 0.74f, y + s * 0.34f) });
+                else { g.DrawLine(p, x + s * 0.32f, y + s * 0.32f, x + s * 0.68f, y + s * 0.68f); g.DrawLine(p, x + s * 0.68f, y + s * 0.32f, x + s * 0.32f, y + s * 0.68f); }
+            }
+        }
+
+        public TaskItem TaskAt(int i) { return i >= 0 && i < Rows.Count ? Rows[i].task : null; }
+        public TaskItem SelectedTask { get { return TaskAt(SelectedIndex); } }
+
+        public void SelectAt(Point p) { int i = IndexFromPoint(p); if (i >= 0 && i < Rows.Count) SelectedIndex = i; }
+
+        // Insert position for a drop at screen point p: before the row under it, or after it when in its lower half
+        public int DropIndexAt(Point screen)
+        {
+            var p = PointToClient(screen);
+            int i = IndexFromPoint(p);
+            if (i < 0 || i >= Rows.Count || Rows[i].task == null) return Rows.Count(r => r.task != null);
+            var b = GetItemRectangle(i);
+            return p.Y > b.Y + b.Height / 2 ? i + 1 : i;
+        }
+
+        public void ShowDropLine(int i) { if (DropLine != i) { DropLine = i; Invalidate(); } }
+    }
+
     class MainForm : Form
     {
         readonly App app;
         readonly Label status = new Label();
-        readonly CheckedListBox mine = new CheckedListBox();
-        readonly ListBox theirs = new ListBox();
+        readonly TaskList mine = new TaskList(), theirs = new TaskList();
         readonly GroupBox theirBox = new GroupBox();
         readonly TextBox newTask = new TextBox(), brag = new TextBox();
-        bool filling;
+        int pressed = -1;          // row the left button went down on (a click or the start of a drag)
+        Point pressedAt;
         public bool Exiting;
 
         public MainForm(App app)
         {
             this.app = app;
-            Text = "Friendly Fire"; Icon = Program.Flame; Font = Util.UiFont(10.5f); ClientSize = new Size(720, 500);
+            Text = "Friendly Fire"; Icon = Program.Flame; Font = Util.UiFont(10.5f); ClientSize = new Size(760, 520);
             StartPosition = FormStartPosition.CenterScreen; MinimumSize = new Size(560, 380);
 
             status.Dock = DockStyle.Top; status.Height = 30; status.Padding = new Padding(10, 6, 0, 0); status.ForeColor = Color.DimGray;
@@ -387,33 +517,59 @@ namespace FriendlyFire
             var grid = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Padding = new Padding(6, 0, 6, 0) };
             grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50)); grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
 
-            // My tasks: add, tick, delete
-            var myBox = new GroupBox { Text = "งานของฉัน", Dock = DockStyle.Fill, Padding = new Padding(8) };
+            // My tasks: add, tick, drag to reorder or over to the friend, delete
+            var myBox = new GroupBox { Text = "งานของฉัน  (ลากเพื่อเรียง หรือลากไปให้เพื่อน)", Dock = DockStyle.Fill, Padding = new Padding(8) };
             var addRow = new Panel { Dock = DockStyle.Bottom, Height = 36, Padding = new Padding(0, 6, 0, 0) };
             var addBtn = new Button { Text = "เพิ่ม", Dock = DockStyle.Right, Width = 70 };
             newTask.Dock = DockStyle.Fill; SetCue(newTask, "งานใหม่...");
             addBtn.Click += (s, e) => AddTask();
             newTask.KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; AddTask(); } };
             addRow.Controls.Add(newTask); addRow.Controls.Add(addBtn);
-            mine.Dock = DockStyle.Fill; mine.CheckOnClick = true; mine.IntegralHeight = false; mine.BorderStyle = BorderStyle.None;
-            mine.ItemCheck += OnTick;
-            mine.KeyDown += (s, e) => { if (e.KeyCode == Keys.Delete) DeleteSelected(); };
+            mine.Dock = DockStyle.Fill; mine.AllowDrop = true;
+            mine.MouseDown += MineDown;
+            mine.MouseMove += MineMove;
+            mine.MouseUp += MineUp;
+            mine.KeyDown += (s, e) =>
+            {
+                var t = mine.SelectedTask;
+                if (t == null) return;
+                if (e.KeyCode == Keys.Delete) DeleteTask(t);
+                else if (e.KeyCode == Keys.Space && !t.offer) { e.SuppressKeyPress = true; Toggle(t); }
+            };
+            mine.DragOver += (s, e) => { var t = Dragged(e); e.Effect = t != null ? DragDropEffects.Move : DragDropEffects.None; mine.ShowDropLine(t != null ? mine.DropIndexAt(new Point(e.X, e.Y)) : -1); };
+            mine.DragLeave += (s, e) => mine.ShowDropLine(-1);
+            mine.DragDrop += (s, e) =>
+            {
+                var t = Dragged(e);
+                int at = mine.DropIndexAt(new Point(e.X, e.Y));
+                mine.ShowDropLine(-1);
+                if (t != null) app.MoveTask(t, at);
+            };
             var menu = new ContextMenuStrip();
-            menu.Items.Add("ลบงานนี้", null, (s, e) => DeleteSelected());
+            menu.Items.Add("ลบงานนี้", null, (s, e) => { var t = mine.SelectedTask; if (t != null) DeleteTask(t); });
             menu.Items.Add("ลบงานที่เสร็จแล้วทั้งหมด", null, (s, e) => { app.Cfg.tasks.RemoveAll(t => t.done); app.Changed("sync", null); });
+            menu.Opening += (s, e) => { var t = mine.SelectedTask; e.Cancel = t != null && t.offer; };   // gifts have their own ✓ / ✗
             mine.ContextMenuStrip = menu;
-            mine.MouseDown += (s, e) => { if (e.Button == MouseButtons.Right) { int i = mine.IndexFromPoint(e.Location); if (i >= 0) mine.SelectedIndex = i; } };
             myBox.Controls.Add(mine); myBox.Controls.Add(addRow);
 
-            // Friend's tasks: read only; finished ones can be removed from this PC
+            // Friend's tasks: read only; finished ones can be removed from this PC; drop a task here to give it
             theirBox.Dock = DockStyle.Fill; theirBox.Padding = new Padding(8);
-            theirs.Dock = DockStyle.Fill; theirs.IntegralHeight = false; theirs.BorderStyle = BorderStyle.None;
+            theirs.Dock = DockStyle.Fill; theirs.AllowDrop = true;
             var theirMenu = new ContextMenuStrip();
-            theirMenu.Items.Add("ลบงานนี้ (เฉพาะเครื่องนี้)", null, (s, e) => { var t = TheirSelected(); if (t != null) app.HideFriendTask(t); });
-            theirMenu.Opening += (s, e) => { var t = TheirSelected(); e.Cancel = t == null || !t.done; };   // unfinished tasks belong to the friend
+            theirMenu.Items.Add("ลบงานนี้ (เฉพาะเครื่องนี้)", null, (s, e) => { var t = theirs.SelectedTask; if (t != null) app.HideFriendTask(t); });
+            theirMenu.Opening += (s, e) => { var t = theirs.SelectedTask; e.Cancel = t == null || !t.done; };   // unfinished tasks belong to the friend
             theirs.ContextMenuStrip = theirMenu;
-            theirs.MouseDown += (s, e) => { if (e.Button == MouseButtons.Right) { int i = theirs.IndexFromPoint(e.Location); if (i >= 0) theirs.SelectedIndex = i; } };
-            theirs.KeyDown += (s, e) => { var t = TheirSelected(); if (e.KeyCode == Keys.Delete && t != null && t.done) app.HideFriendTask(t); };
+            theirs.MouseDown += (s, e) => { if (e.Button == MouseButtons.Right) theirs.SelectAt(e.Location); };
+            theirs.KeyDown += (s, e) => { var t = theirs.SelectedTask; if (e.KeyCode == Keys.Delete && t != null && t.done) app.HideFriendTask(t); };
+            theirs.DragOver += (s, e) =>
+            {
+                var t = Dragged(e);
+                bool ok = t != null && !t.done;
+                e.Effect = ok ? DragDropEffects.Move : DragDropEffects.None;
+                theirs.BackColor = ok ? Color.FromArgb(255, 244, 232) : SystemColors.Window;
+            };
+            theirs.DragLeave += (s, e) => theirs.BackColor = SystemColors.Window;
+            theirs.DragDrop += (s, e) => { theirs.BackColor = SystemColors.Window; var t = Dragged(e); if (t != null && !t.done) app.GiveTask(t); };
             theirBox.Controls.Add(theirs);
             Activated += (s, e) => app.MarkSeen(true);
 
@@ -430,6 +586,43 @@ namespace FriendlyFire
             box.HandleCreated += (s, e) => Native.SendMessage(box.Handle, 0x1501, (IntPtr)1, cue);
         }
 
+        static TaskItem Dragged(DragEventArgs e) { return e.Data.GetData(typeof(TaskItem)) as TaskItem; }
+
+        void MineDown(object sender, MouseEventArgs e)
+        {
+            int i = mine.IndexFromPoint(e.Location);
+            if (e.Button == MouseButtons.Right) { mine.SelectAt(e.Location); return; }
+            pressed = mine.TaskAt(i) != null ? i : -1;
+            pressedAt = e.Location;
+        }
+
+        // Moving past the drag distance starts a drag (gifts can't be dragged until they're taken)
+        void MineMove(object sender, MouseEventArgs e)
+        {
+            if (pressed < 0 || e.Button != MouseButtons.Left) return;
+            var drag = SystemInformation.DragSize;
+            if (Math.Abs(e.X - pressedAt.X) < drag.Width && Math.Abs(e.Y - pressedAt.Y) < drag.Height) return;
+            var t = mine.TaskAt(pressed);
+            pressed = -1;
+            if (t == null || t.offer) return;
+            mine.DoDragDrop(t, DragDropEffects.Move);
+            mine.ShowDropLine(-1);
+            theirs.BackColor = SystemColors.Window;
+        }
+
+        // A click without a drag: tick / untick, or the ✓ / ✗ of a gift
+        void MineUp(object sender, MouseEventArgs e)
+        {
+            int i = pressed;
+            pressed = -1;
+            if (e.Button != MouseButtons.Left || i < 0 || mine.IndexFromPoint(e.Location) != i) return;
+            var t = mine.TaskAt(i);
+            if (t == null) return;
+            if (!t.offer) Toggle(t);
+            else if (mine.OkRect(i).Contains(e.Location)) app.TakeGift(t, true);
+            else if (mine.NoRect(i).Contains(e.Location)) app.TakeGift(t, false);
+        }
+
         void AddTask()
         {
             string text = newTask.Text.Trim();
@@ -439,23 +632,19 @@ namespace FriendlyFire
             app.Changed("sync", null);
         }
 
-        void DeleteSelected()
+        void DeleteTask(TaskItem t)
         {
-            var t = mine.SelectedItem as TaskItem;
-            if (t == null) return;
+            if (t.offer) return;
             app.Cfg.tasks.Remove(t);
             app.Changed("sync", null);
         }
 
-        void OnTick(object sender, ItemCheckEventArgs e)
+        void Toggle(TaskItem t)
         {
-            if (filling) return;
-            var t = (TaskItem)mine.Items[e.Index];
-            t.done = e.NewValue == CheckState.Checked;
+            t.done = !t.done;
             t.doneAt = t.done ? Util.NowSec() : 0;
             t.seenAt = t.doneAt;   // you saw it when you ticked it
-            // After this event the box has its new state; send once it's applied
-            BeginInvoke((Action)(() => app.Changed(t.done ? "done" : "sync", t.done ? t.text : null)));
+            app.Changed(t.done ? "done" : "sync", t.done ? t.text : null);
         }
 
         void Brag()
@@ -469,30 +658,22 @@ namespace FriendlyFire
 
         public void FillMine()
         {
-            filling = true;
-            mine.BeginUpdate();
-            mine.Items.Clear();
-            foreach (var t in app.Cfg.tasks) mine.Items.Add(t, t.done);
-            mine.EndUpdate();
-            filling = false;
+            var rows = app.Cfg.tasks.Select(t => t.offer
+                ? new Row { task = t, text = app.FriendLabel + " ส่งงานให้: " + t.text, grey = true, buttons = true }
+                : new Row { task = t, text = t.text, check = true }).ToList();
+            if (rows.Count == 0) rows.Add(new Row { text = "(ยังไม่มีงาน พิมพ์งานใหม่ด้านล่าง)" });
+            mine.SetRows(rows);
         }
 
         public void FillTheirs()
         {
             theirBox.Text = "งานของ " + app.FriendLabel;
-            theirs.BeginUpdate();
-            theirs.Items.Clear();
-            theirShown = app.Cfg.friendTasks.ToList();
-            foreach (var t in theirShown) theirs.Items.Add((t.done ? "✓  " : "○  ") + t.text);
-            if (theirShown.Count == 0) theirs.Items.Add(app.Cfg.friendName == "" ? "(รอเพื่อนเข้าร่วม...)" : "(ยังไม่มีงาน)");
-            theirs.EndUpdate();
-        }
-
-        List<TaskItem> theirShown = new List<TaskItem>();
-        TaskItem TheirSelected()
-        {
-            int i = theirs.SelectedIndex;
-            return i >= 0 && i < theirShown.Count ? theirShown[i] : null;
+            var rows = app.Cfg.friendTasks.Select(t => new Row { task = t, text = t.text, grey = t.offer, tag = t.offer ? "รอรับ" : null }).ToList();
+            // Gifts on their way: the friend's list doesn't show them yet
+            foreach (var g in app.Cfg.giving)
+                if (!app.Cfg.friendTasks.Any(t => t.id == g.id)) rows.Add(new Row { task = g, text = g.text, grey = true, tag = "กำลังส่ง" });
+            if (rows.Count == 0) rows.Add(new Row { text = app.Cfg.friendName == "" ? "(รอเพื่อนเข้าร่วม...)" : "(ยังไม่มีงาน)" });
+            theirs.SetRows(rows);
         }
 
         public bool Watching { get { return Visible && WindowState != FormWindowState.Minimized && Form.ActiveForm == this; } }
@@ -598,9 +779,46 @@ namespace FriendlyFire
         public Msg Make(string type, string text)
         {
             // All my tasks (seenAt stays on this PC: the friend's PC decides when a finished task goes away there)
-            var list = Cfg.tasks.Select(t => new TaskItem { id = t.id, text = t.text.Length > 80 ? t.text.Substring(0, 80) + "…" : t.text, done = t.done, doneAt = t.doneAt })
+            var list = Cfg.tasks.Select(t => new TaskItem { id = t.id, text = Short(t.text, 80), done = t.done, doneAt = t.doneAt, offer = t.offer })
                                 .ToList();
-            return new Msg { from = Cfg.clientId, name = Cfg.name, type = type, text = text, time = Util.NowMs(), tasks = list };
+            var gifts = Cfg.giving.Select(t => new TaskItem { id = t.id, text = Short(t.text, 300) }).ToList();
+            var got = Cfg.giftsDone.Skip(Math.Max(0, Cfg.giftsDone.Count - 50)).ToList();
+            return new Msg { from = Cfg.clientId, name = Cfg.name, type = type, text = text, time = Util.NowMs(), tasks = list, gifts = gifts, got = got };
+        }
+
+        static string Short(string s, int n) { return s.Length > n ? s.Substring(0, n) + "…" : s; }
+
+        // Drag inside my list: put the task at position "at" (counted before it was taken out)
+        public void MoveTask(TaskItem t, int at)
+        {
+            int from = Cfg.tasks.IndexOf(t);
+            if (from < 0) return;
+            if (at > from) at--;
+            at = Math.Max(0, Math.Min(at, Cfg.tasks.Count - 1));
+            if (at == from) return;
+            Cfg.tasks.RemoveAt(from);
+            Cfg.tasks.Insert(at, t);
+            Changed("sync", null);
+        }
+
+        // Drag onto the friend's list: the task leaves my list and waits on theirs for ✓ / ✗
+        public void GiveTask(TaskItem t)
+        {
+            if (Cfg.friendName == "") { Notice.Show("ยังไม่มีเพื่อนในคู่", "ส่งรหัสเชิญให้เพื่อนก่อน", null); return; }
+            Cfg.tasks.Remove(t);
+            Cfg.giving.Add(new TaskItem { id = t.id, text = t.text });
+            Changed("give", t.text);
+            main.FillTheirs();
+            Notice.Show("ส่งงานให้ " + FriendLabel + " แล้ว 🎁", t.text, null);
+        }
+
+        // ✓ keeps a gift as my own task, ✗ throws it away; the friend gets told either way
+        public void TakeGift(TaskItem t, bool take)
+        {
+            if (take) t.offer = false; else Cfg.tasks.Remove(t);
+            if (!Cfg.giftsDone.Contains(t.id)) Cfg.giftsDone.Add(t.id);
+            if (Cfg.giftsDone.Count > 300) Cfg.giftsDone.RemoveRange(0, Cfg.giftsDone.Count - 300);
+            Changed(take ? "accept" : "reject", t.text);
         }
 
         // Something changed on my side: save, redraw, tell the friend
@@ -615,11 +833,29 @@ namespace FriendlyFire
         {
             if (!string.IsNullOrEmpty(m.name)) Cfg.friendName = m.name;
             if (m.tasks != null && m.time >= Cfg.friendTasksTime) { MergeFriend(m.tasks); Cfg.friendTasksTime = m.time; }
+            // My gifts that reached the friend's list (or were already handled there) don't need sending any more
+            Cfg.giving.RemoveAll(g => (m.tasks != null && m.tasks.Any(t => t.id == g.id)) || (m.got != null && m.got.Contains(g.id)));
+            // Gifts for me: add each one once, on top, waiting for ✓ / ✗
+            var newGifts = new List<TaskItem>();
+            if (m.gifts != null)
+                foreach (var g in m.gifts)
+                    if (g.id != null && g.text != null && !Cfg.giftsDone.Contains(g.id) && !Cfg.tasks.Any(t => t.id == g.id))
+                    {
+                        var t = new TaskItem { id = g.id, text = g.text, offer = true };
+                        Cfg.tasks.Insert(newGifts.Count, t);
+                        newGifts.Add(t);
+                    }
             bool fresh = time > Cfg.lastSeen;   // not shown before (messages are replayed after a restart)
             if (fresh) Cfg.lastSeen = time;
             Save();
             main.FillTheirs();
             MarkSeen(false);
+            if (newGifts.Count > 0)
+            {
+                main.FillMine();
+                relay.Publish(Make("sync", null));   // the friend sees them as "รอรับ" and stops sending
+                foreach (var g in newGifts) Notice.Show("🎁 " + FriendLabel + " ส่งงานให้คุณ", g.text + "\n(เปิดแอปแล้วกด ✓ รับ หรือ ✗ ทิ้ง)", null);
+            }
             main.SetStatus(true);
             if (!fresh) return;
 
@@ -632,6 +868,10 @@ namespace FriendlyFire
                 });
             else if (m.type == "react")
                 Notice.Show(FriendLabel + " ส่ง " + m.text + " ให้คุณ" + when, null, null);
+            else if (m.type == "accept")
+                Notice.Show("👍 " + FriendLabel + " รับงานที่คุณส่งแล้ว" + when, m.text, null);
+            else if (m.type == "reject")
+                Notice.Show(FriendLabel + " ไม่รับงานที่คุณส่ง" + when, m.text, null);
         }
 
         // The friend's new list, but finished tasks stay here until they've been seen for a day (or removed here)
@@ -736,6 +976,8 @@ namespace FriendlyFire
             Cfg.friendName = "";
             Cfg.friendTasks.Clear();
             Cfg.friendHidden.Clear();
+            Cfg.giving.Clear();
+            Cfg.tasks.RemoveAll(t => t.offer);
             Cfg.friendTasksTime = 0;
             Cfg.lastSeen = Util.NowSec();   // no pop-ups for what the friend did before we joined
             Save();
@@ -807,7 +1049,7 @@ namespace FriendlyFire
 
     static class Program
     {
-        public const string Version = "1.0.1";
+        public const string Version = "1.0.2";
         public static Icon Flame;
         static Mutex mutex;
         public static string RestartArgs = "";   // the same -Data/-Name/-Code after an update
