@@ -53,6 +53,10 @@ namespace FriendlyFire
         public bool notifySound = true;
         public List<string> notifyOff = new List<string> { "accept", "reject" };   // kinds turned off in Settings → ขั้นสูง
         public List<string> reactions = new List<string> { "🔥", "😎", "👍", "❓" };   // the 4 reaction buttons, chosen in Settings
+        public int notifyExtra;                                  // pop-ups stay 1–8 s by text length plus this many seconds (-1 = until closed)
+        public string notifyPlace = "br";                        // corner/edge: br bl tr tl bc tc
+        public int notifySize = 1;                               // 0 small, 1 medium, 2 large
+        public int doneKeepHours = 24;                           // finished tasks go away this long after they were seen here (0 = never)
         public long notifyMuteUntil;                             // unix s: all pop-ups paused until then (🔕 on a pop-up)
     }
 
@@ -285,11 +289,18 @@ namespace FriendlyFire
         public static void Show(string kind, string title, string text, Action<string> react)
         {
             if (!Allowed(kind)) return;
-            waiting.Enqueue(() => { if (Allowed(kind)) Open(kind, title, text, react); else Next(); });   // muting from a pop-up also skips the ones waiting
+            waiting.Enqueue(() => { if (Allowed(kind)) Open(kind, title, text, react, null); else Next(); });   // muting from a pop-up also skips the ones waiting
             if (current == null || current.IsDisposed) Next();
         }
 
         public static void Show(string title, string text, Action<string> react) { Show(null, title, text, react); }
+
+        // A pop-up with a "↩ เลิกทำ" button (always shown: it answers something you just did)
+        public static void ShowUndo(string title, string text, Action undo)
+        {
+            waiting.Enqueue(() => Open(null, title, text, null, undo));
+            if (current == null || current.IsDisposed) Next();
+        }
 
         static void Next()
         {
@@ -297,21 +308,29 @@ namespace FriendlyFire
             if (waiting.Count > 0) waiting.Dequeue()();
         }
 
-        static void Open(string kind, string title, string text, Action<string> react)
+        // Where pop-ups go (Settings → ตำแหน่ง) and how big they are (Settings → ขนาด)
+        public static readonly string[] Places = { "br", "bl", "tr", "tl", "bc", "tc" };
+        public static readonly string[] PlaceNames = { "มุมขวาล่าง", "มุมซ้ายล่าง", "มุมขวาบน", "มุมซ้ายบน", "กลางด้านล่าง", "กลางด้านบน" };
+        public static readonly string[] SizeNames = { "เล็ก", "กลาง", "ใหญ่" };
+        static readonly float[] Zooms = { 0.85f, 1f, 1.3f };
+
+        static void Open(string kind, string title, string text, Action<string> react, Action undo)
         {
+            float z = Zooms[Settings == null ? 1 : Math.Max(0, Math.Min(2, Settings.notifySize))];
+            Func<int, int> S = v => (int)Math.Round(v * z);
             var f = current = new Notice
             {
                 Text = "Friendly Fire", TopMost = true, FormBorderStyle = FormBorderStyle.None, ShowInTaskbar = false,
-                StartPosition = FormStartPosition.Manual, Font = Util.UiFont(10), BackColor = Paper
+                StartPosition = FormStartPosition.Manual, Font = Util.UiFont(10 * z), BackColor = Paper
             };
             f.Paint += (s, e) => { using (var p = new Pen(Edge)) e.Graphics.DrawRectangle(p, 0, 0, f.ClientSize.Width - 1, f.ClientSize.Height - 1); };
-            var head = new Label { Text = title, Font = new Font("Segoe UI", 11, FontStyle.Bold), ForeColor = Color.FromArgb(190, 70, 0),
-                                   Location = new Point(12, 10), AutoSize = true, MaximumSize = new Size(320, 0) };
+            var head = new Label { Text = title, Font = new Font("Segoe UI", 11 * z, FontStyle.Bold), ForeColor = Color.FromArgb(190, 70, 0),
+                                   Location = new Point(S(12), S(10)), AutoSize = true, MaximumSize = new Size(S(320), 0) };
             f.Controls.Add(head);
             int bottom = head.Bottom;
             if (!string.IsNullOrEmpty(text))
             {
-                var body = new Label { Text = text, Location = new Point(12, bottom + 4), AutoSize = true, MaximumSize = new Size(320, 0) };
+                var body = new Label { Text = text, Location = new Point(S(12), bottom + S(4)), AutoSize = true, MaximumSize = new Size(S(320), 0) };
                 f.Controls.Add(body);
                 bottom = body.Bottom;
             }
@@ -319,25 +338,33 @@ namespace FriendlyFire
             foreach (Control c in f.Controls) right = Math.Max(right, c.Right);
             if (react != null)
             {
-                int x = 12;
+                int x = S(12);
                 foreach (string e in Reactions)
                 {
                     string emoji = e;
-                    var b = new Button { Text = emoji, Font = Util.EmojiFont(13), Location = new Point(x, bottom + 8), Size = new Size(48, 38), FlatStyle = FlatStyle.Flat };
+                    var b = new Button { Text = emoji, Font = Util.EmojiFont(13 * z), Location = new Point(x, bottom + S(8)), Size = new Size(S(48), S(38)), FlatStyle = FlatStyle.Flat };
                     b.Click += (s, ev) => { react(emoji); f.Close(); };
                     f.Controls.Add(b);
-                    x += 54;
+                    x += S(54);
                 }
-                bottom += 8 + 38;
-                right = Math.Max(right, x - 6);
+                bottom += S(8) + S(38);
+                right = Math.Max(right, x - S(6));
             }
-            int width = Math.Max(right + 12 + 56, 240);   // room on the right for 🔕 and ✕
-            f.ClientSize = new Size(width, bottom + 12);
+            if (undo != null)
+            {
+                var b = new Button { Text = "↩ เลิกทำ", Location = new Point(S(12), bottom + S(8)), Size = new Size(S(110), S(32)), FlatStyle = FlatStyle.Flat, BackColor = Color.White };
+                b.Click += (s, ev) => { undo(); f.Close(); };
+                f.Controls.Add(b);
+                bottom += S(8) + S(32);
+                right = Math.Max(right, b.Right);
+            }
+            int width = Math.Max(right + S(12) + S(56), S(240));   // room on the right for 🔕 and ✕
+            f.ClientSize = new Size(width, bottom + S(12));
 
             // 🔕 (mute) and ✕ (close): only while the mouse is over the pop-up
-            var close = TopButton("✕", width - 30);
+            var close = TopButton("✕", width - S(30), z);
             close.Click += (s, e) => f.Close();
-            var mute = TopButton("🔕", width - 58);
+            var mute = TopButton("🔕", width - S(58), z);
             var menu = new ContextMenuStrip { Font = Util.UiFont(10) };
             menu.Items.Add("ปิดการแจ้งเตือน 1 ชั่วโมง", null, (s, e) => { MuteFor(3600); f.Close(); });
             menu.Items.Add("ปิดการแจ้งเตือน 1 วัน", null, (s, e) => { MuteFor(86400); f.Close(); });
@@ -356,18 +383,25 @@ namespace FriendlyFire
             close.Visible = false; mute.Visible = false;
 
             Rectangle wa = Screen.PrimaryScreen.WorkingArea;
-            f.Location = new Point(wa.Right - f.Width - 12, wa.Bottom - f.Height - 12);
+            string place = Settings == null ? "br" : Settings.notifyPlace;
+            int gap = 12;
+            int px = place.EndsWith("l") ? wa.Left + gap : place.EndsWith("c") ? wa.Left + (wa.Width - f.Width) / 2 : wa.Right - f.Width - gap;
+            int py = place.StartsWith("t") ? wa.Top + gap : wa.Bottom - f.Height - gap;
+            f.Location = new Point(px, py);
             f.FormClosed += (s, e) => { menu.Dispose(); Next(); };
 
-            // Stay 8 s (20 s with reaction buttons), then fade out over the last second; hovering (or the mute menu) keeps it
-            DateTime fadeAt = DateTime.Now.AddSeconds(react != null ? 20 : 8);
+            // Every pop-up stays 1–8 s depending on how much there is to read, plus the extra time from Settings
+            // (-1 = until closed), then fades out over the last second; hovering (or the mute menu) keeps it
+            int extra = Settings == null ? 0 : Settings.notifyExtra;
+            int stay = extra < 0 ? 0 : AutoSeconds(title, text) + extra;
+            DateTime fadeAt = stay > 0 ? DateTime.Now.AddSeconds(stay) : DateTime.MaxValue;
             var t = new System.Windows.Forms.Timer { Interval = 50 };
             t.Tick += (s, e) =>
             {
                 if (f.IsDisposed) { t.Dispose(); return; }
                 bool over = f.Bounds.Contains(Cursor.Position) || menu.Visible;
                 close.Visible = over; mute.Visible = over && Settings != null;
-                if (over) { fadeAt = DateTime.Now.AddSeconds(3); f.Opacity = 1; return; }
+                if (over) { if (stay > 0) fadeAt = DateTime.Now.AddSeconds(3); f.Opacity = 1; return; }
                 double into = (DateTime.Now - fadeAt).TotalSeconds;
                 if (into < 0) return;
                 if (into >= 1) { t.Dispose(); f.Close(); return; }
@@ -377,11 +411,17 @@ namespace FriendlyFire
             f.Show();
             PlaySound();
         }
-
-        static Label TopButton(string text, int x)
+        // Auto: about the time it takes to read it, 1 s at least and 8 s at most
+        static int AutoSeconds(string title, string text)
         {
-            var b = new Label { Text = text, Font = Util.EmojiFont(10), ForeColor = Color.DimGray, TextAlign = System.Drawing.ContentAlignment.MiddleCenter,
-                                Location = new Point(x, 4), Size = new Size(26, 24), Cursor = Cursors.Hand };
+            int chars = (title ?? "").Length + (text ?? "").Length;
+            return Math.Max(1, Math.Min(8, 1 + (int)Math.Round(chars / 15.0)));
+        }
+
+        static Label TopButton(string text, int x, float z)
+        {
+            var b = new Label { Text = text, Font = Util.EmojiFont(10 * z), ForeColor = Color.DimGray, TextAlign = System.Drawing.ContentAlignment.MiddleCenter,
+                                Location = new Point(x, (int)(4 * z)), Size = new Size((int)(26 * z), (int)(24 * z)), Cursor = Cursors.Hand };
             b.MouseEnter += (s, e) => b.BackColor = Color.FromArgb(255, 220, 190);
             b.MouseLeave += (s, e) => b.BackColor = Color.Transparent;
             return b;
@@ -506,6 +546,13 @@ namespace FriendlyFire
         public Rectangle OkRect(int i) { var b = GetItemRectangle(i); return new Rectangle(b.Right - 2 * Btn - 12, b.Y + 4, Btn, Btn); }
         public Rectangle NoRect(int i) { var b = GetItemRectangle(i); return new Rectangle(b.Right - Btn - 6, b.Y + 4, Btn, Btn); }
 
+        public int Hot = -1;      // row under the mouse: drawn lifted
+        public int Picked = -1;   // row being dragged: lifted, with a light red cover
+        public bool PickedOut;    // the dragged row is outside the window: letting go throws it away
+
+        static readonly Color DoneBack = Color.FromArgb(236, 236, 236), GiftBack = Color.FromArgb(220, 244, 225),
+                              WaitBack = Color.FromArgb(234, 234, 234), PickBack = Color.FromArgb(255, 222, 220), SelBack = Color.FromArgb(255, 238, 220);
+
         protected override void OnDrawItem(DrawItemEventArgs e)
         {
             if (e.Index < 0 || e.Index >= Rows.Count) return;
@@ -513,18 +560,42 @@ namespace FriendlyFire
             var b = e.Bounds;
             var g = e.Graphics;
             bool sel = ShowSelection && (e.State & DrawItemState.Selected) != 0 && r.task != null;
-            Color back = r.grey ? Color.FromArgb(234, 234, 234) : sel ? Color.FromArgb(255, 238, 220) : BackColor;
-            using (var br = new SolidBrush(back)) g.FillRectangle(br, b);
+            bool picked = Picked == e.Index, lifted = r.task != null && (picked || Hot == e.Index);
+            Color back = picked ? (PickedOut ? Color.FromArgb(255, 200, 195) : PickBack) : sel ? SelBack : r.buttons ? GiftBack : r.grey ? WaitBack : r.task != null && r.task.done ? DoneBack : BackColor;
+            using (var br = new SolidBrush(BackColor)) g.FillRectangle(br, b);
 
-            int lineY = b.Y + 6;   // the first text line; marks and buttons line up with it
+            int up = 0;   // lifted rows move up a little and get a shadow, like a card picked off the table
+            if (lifted)
+            {
+                up = picked ? 2 : 1;   // hover: just a hint of lift; dragging: a bit more
+                int layers = picked ? 3 : 2, alpha = picked ? 18 : 9;
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                var card = new Rectangle(b.X + 3, b.Y + 1, b.Width - 7, b.Height - 3 - layers);
+                for (int k = layers; k >= 1; k--)
+                    using (var path = Round(new Rectangle(card.X, card.Y + k, card.Width, card.Height), 7))
+                    using (var sh = new SolidBrush(Color.FromArgb(alpha * (layers + 1 - k), 0, 0, 0))) g.FillPath(sh, path);
+                using (var path = Round(card, 7))
+                {
+                    using (var br = new SolidBrush(back == BackColor ? Color.White : back)) g.FillPath(br, path);
+                    using (var pen = new Pen(picked ? Color.FromArgb(240, 150, 140) : Color.FromArgb(228, 228, 228))) g.DrawPath(pen, path);
+                }
+                g.SmoothingMode = SmoothingMode.Default;
+            }
+            else
+            {
+                if (back != BackColor) using (var br = new SolidBrush(back)) g.FillRectangle(br, b.X + 3, b.Y + 1, b.Width - 7, b.Height - 3);
+                using (var p = new Pen(Color.FromArgb(238, 238, 238))) g.DrawLine(p, b.X + 6, b.Bottom - 1, b.Right - 6, b.Bottom - 1);
+            }
+
+            int top = b.Y - up, lineY = top + 6;   // the first text line; marks and buttons line up with it
             if (r.check)
-                CheckBoxRenderer.DrawCheckBox(g, new Point(b.X + 9, b.Y + 10), r.task.done ? CheckBoxState.CheckedNormal : CheckBoxState.UncheckedNormal);
+                CheckBoxRenderer.DrawCheckBox(g, new Point(b.X + 9, top + 10), r.task.done ? CheckBoxState.CheckedNormal : CheckBoxState.UncheckedNormal);
             else if (r.task != null && !r.buttons)
                 TextRenderer.DrawText(g, r.task.done ? "✓" : "○", Font, new Rectangle(b.X + 4, lineY, 26, 22), r.task.done ? Green : Color.Gray, TextFormatFlags.HorizontalCenter | TextFormatFlags.NoPrefix);
             else if (r.buttons)
-                TextRenderer.DrawText(g, "🎁", Font, new Rectangle(b.X + 4, lineY, 26, 22), Orange, TextFormatFlags.HorizontalCenter | TextFormatFlags.NoPrefix);
+                TextRenderer.DrawText(g, "🎁", Font, new Rectangle(b.X + 4, lineY, 26, 22), Green, TextFormatFlags.HorizontalCenter | TextFormatFlags.NoPrefix);
 
-            Color fore = r.task == null || r.grey || r.task.done ? Color.Gray : ForeColor;
+            Color fore = r.task == null || r.grey || r.task.done ? Color.Gray : r.buttons ? Color.FromArgb(25, 110, 45) : ForeColor;
             TextRenderer.DrawText(g, r.text, Font, new Rectangle(b.X + TextLeft, lineY, TextWidth(r), b.Height - 6), fore, Wrap);
 
             if (r.tag != null)
@@ -534,16 +605,44 @@ namespace FriendlyFire
             if (r.buttons)
             {
                 g.SmoothingMode = SmoothingMode.AntiAlias;
-                DrawButton(g, OkRect(e.Index), Green, true);
-                DrawButton(g, NoRect(e.Index), Red, false);
+                var ok = OkRect(e.Index); ok.Offset(0, -up);
+                var no = NoRect(e.Index); no.Offset(0, -up);
+                DrawButton(g, ok, Green, true);
+                DrawButton(g, no, Red, false);
                 g.SmoothingMode = SmoothingMode.Default;
             }
 
-            using (var p = new Pen(Color.FromArgb(238, 238, 238))) g.DrawLine(p, b.X + 6, b.Bottom - 1, b.Right - 6, b.Bottom - 1);
+            if (picked && PickedOut)
+                using (var small = new Font("Segoe UI", 9, FontStyle.Bold))
+                {
+                    var pill = new Rectangle(b.Right - 118, top + 4, 108, 22);
+                    using (var br = new SolidBrush(Red)) g.FillRectangle(br, pill);
+                    TextRenderer.DrawText(g, "ปล่อยเพื่อทิ้ง 🗑", small, pill, Color.White, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                }
+
             if (DropLine == e.Index || (DropLine == Rows.Count && e.Index == Rows.Count - 1))
                 using (var br = new SolidBrush(Orange)) g.FillRectangle(br, b.X + 2, DropLine == e.Index ? b.Y : b.Bottom - 3, b.Width - 4, 3);
         }
 
+        static GraphicsPath Round(Rectangle r, int radius)
+        {
+            int d = radius * 2;
+            var path = new GraphicsPath();
+            path.AddArc(r.X, r.Y, d, d, 180, 90);
+            path.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            path.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            path.CloseFigure();
+            return path;
+        }
+
+        void Redraw(int i) { if (i >= 0 && i < Items.Count) Invalidate(GetItemRectangle(i)); }
+
+        public void SetHot(int i) { if (Hot == i) return; int old = Hot; Hot = i; Redraw(old); Redraw(i); }
+        public void SetPicked(int i) { if (Picked == i) return; int old = Picked; Picked = i; PickedOut = false; Redraw(old); Redraw(i); }
+        public void SetPickedOut(bool on) { if (PickedOut == on) return; PickedOut = on; Redraw(Picked); }
+
+        protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); SetHot(-1); }
         static void DrawButton(Graphics g, Rectangle r, Color c, bool tick)
         {
             using (var br = new SolidBrush(c)) g.FillEllipse(br, r);
@@ -558,14 +657,20 @@ namespace FriendlyFire
         public TaskItem TaskAt(int i) { return i >= 0 && i < Rows.Count ? Rows[i].task : null; }
         public TaskItem SelectedTask { get { return TaskAt(SelectedIndex); } }
 
-        public void SelectAt(Point p) { int i = IndexFromPoint(p); if (i >= 0 && i < Rows.Count) SelectedIndex = i; }
+        public int RowAt(Point p)
+        {
+            int i = IndexFromPoint(p);
+            return i >= 0 && i < Rows.Count && GetItemRectangle(i).Contains(p) ? i : -1;
+        }
+
+        public void SelectAt(Point p) { int i = RowAt(p); if (i >= 0) SelectedIndex = i; else ClearSelected(); }
 
         // Insert position for a drop at screen point p: before the row under it, or after it when in its lower half
         public int DropIndexAt(Point screen)
         {
             var p = PointToClient(screen);
-            int i = IndexFromPoint(p);
-            if (i < 0 || i >= Rows.Count || Rows[i].task == null) return Rows.Count(r => r.task != null);
+            int i = RowAt(p);
+            if (i < 0 || Rows[i].task == null) return Rows.Count(r => r.task != null);
             var b = GetItemRectangle(i);
             return p.Y > b.Y + b.Height / 2 ? i + 1 : i;
         }
@@ -575,10 +680,11 @@ namespace FriendlyFire
         protected override void OnMouseMove(MouseEventArgs e)
         {
             base.OnMouseMove(e);
-            int i = IndexFromPoint(e.Location);
+            int i = RowAt(e.Location);
             var r = i >= 0 && i < Rows.Count ? Rows[i] : null;
             bool hot = r != null && ((r.check && CheckRect(i).Contains(e.Location)) || (r.buttons && (OkRect(i).Contains(e.Location) || NoRect(i).Contains(e.Location))));
             Cursor = hot ? Cursors.Hand : Cursors.Default;
+            SetHot(r != null && r.task != null ? i : -1);
         }
     }
 
@@ -620,7 +726,7 @@ namespace FriendlyFire
             grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50)); grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
 
             // My tasks: add, tick, drag to reorder or over to the friend, delete
-            var myBox = new GroupBox { Text = "งานของฉัน  (ลากเพื่อเรียง หรือลากไปให้เพื่อน)", Dock = DockStyle.Fill, Padding = new Padding(8) };
+            var myBox = new GroupBox { Text = "งานของฉัน  (ลากเพื่อเรียง, ไปให้เพื่อน หรือออกนอกหน้าต่างเพื่อทิ้ง)", Dock = DockStyle.Fill, Padding = new Padding(8) };
             var addRow = new Panel { Dock = DockStyle.Bottom, Height = 36, Padding = new Padding(0, 6, 0, 0) };
             var addBtn = new Button { Text = "เพิ่ม", Dock = DockStyle.Right, Width = 70 };
             newTask.Dock = DockStyle.Fill; SetCue(newTask, "งานใหม่...");
@@ -633,6 +739,7 @@ namespace FriendlyFire
             mine.MouseUp += MineUp;
             mine.DragOver += (s, e) => { var t = Dragged(e); e.Effect = t != null ? DragDropEffects.Move : DragDropEffects.None; mine.ShowDropLine(t != null ? mine.DropIndexAt(new Point(e.X, e.Y)) : -1); };
             mine.DragLeave += (s, e) => mine.ShowDropLine(-1);
+            mine.QueryContinueDrag += (s, e) => mine.SetPickedOut(!Bounds.Contains(Cursor.Position));   // say "ปล่อยเพื่อทิ้ง" outside the window
             mine.DragDrop += (s, e) =>
             {
                 var t = Dragged(e);
@@ -641,9 +748,15 @@ namespace FriendlyFire
                 if (t != null) app.MoveTask(t, at);
             };
             var menu = new ContextMenuStrip();
-            menu.Items.Add("ลบงานนี้", null, (s, e) => { var t = mine.SelectedTask; if (t != null) DeleteTask(t); });
-            menu.Items.Add("ลบงานที่เสร็จแล้วทั้งหมด", null, (s, e) => { app.Cfg.tasks.RemoveAll(t => t.done); app.Changed("sync", null); });
-            menu.Opening += (s, e) => { var t = mine.SelectedTask; e.Cancel = t != null && t.offer; };   // gifts have their own ✓ / ✗
+            var delOne = menu.Items.Add("ลบงานนี้", null, (s, e) => { var t = mine.SelectedTask; if (t != null) DeleteTask(t); });
+            var delDone = menu.Items.Add("ลบงานที่เสร็จแล้วทั้งหมด", null, (s, e) => { app.Cfg.tasks.RemoveAll(t => t.done); app.Changed("sync", null); });
+            menu.Opening += (s, e) =>
+            {
+                var t = mine.SelectedTask;
+                delOne.Enabled = t != null && !t.offer;   // gifts have their own ✓ / ✗
+                delDone.Enabled = app.Cfg.tasks.Any(x => x.done);
+                e.Cancel = !delOne.Enabled && !delDone.Enabled;
+            };
             mine.ContextMenuStrip = menu;
             menu.Opened += (s, e) => { mine.ShowSelection = true; mine.Invalidate(); };
             menu.Closed += (s, e) => { mine.ShowSelection = false; mine.Invalidate(); };
@@ -653,8 +766,15 @@ namespace FriendlyFire
             theirBox.Dock = DockStyle.Fill; theirBox.Padding = new Padding(8);
             theirs.Dock = DockStyle.Fill; theirs.AllowDrop = true;
             var theirMenu = new ContextMenuStrip();
-            theirMenu.Items.Add("ลบงานนี้ (เฉพาะเครื่องนี้)", null, (s, e) => { var t = theirs.SelectedTask; if (t != null) app.HideFriendTask(t); });
-            theirMenu.Opening += (s, e) => { var t = theirs.SelectedTask; e.Cancel = t == null || !t.done; };   // unfinished tasks belong to the friend
+            var hideOne = theirMenu.Items.Add("ลบงานนี้ (เฉพาะเครื่องนี้)", null, (s, e) => { var t = theirs.SelectedTask; if (t != null) app.HideFriendTask(t); });
+            var hideDone = theirMenu.Items.Add("ลบงานที่เสร็จแล้วทั้งหมดของเพื่อน (เฉพาะเครื่องนี้)", null, (s, e) => app.HideFriendDone());
+            theirMenu.Opening += (s, e) =>
+            {
+                var t = theirs.SelectedTask;
+                hideOne.Enabled = t != null && t.done;   // unfinished tasks belong to the friend
+                hideDone.Enabled = app.Cfg.friendTasks.Any(x => x.done);
+                e.Cancel = !hideOne.Enabled && !hideDone.Enabled;
+            };
             theirs.ContextMenuStrip = theirMenu;
             theirMenu.Opened += (s, e) => { theirs.ShowSelection = true; theirs.Invalidate(); };
             theirMenu.Closed += (s, e) => { theirs.ShowSelection = false; theirs.Invalidate(); };
@@ -688,7 +808,7 @@ namespace FriendlyFire
 
         void MineDown(object sender, MouseEventArgs e)
         {
-            int i = mine.IndexFromPoint(e.Location);
+            int i = mine.RowAt(e.Location);
             if (e.Button == MouseButtons.Right) { mine.SelectAt(e.Location); return; }
             pressed = mine.TaskAt(i) != null ? i : -1;
             pressedAt = e.Location;
@@ -704,7 +824,12 @@ namespace FriendlyFire
             pressed = -1;
             if (t == null || t.offer) return;
             mine.Capture = false;   // otherwise the list keeps moving its selection with the mouse
-            mine.DoDragDrop(t, DragDropEffects.Move);
+            mine.SetHot(-1);
+            mine.SetPicked(mine.Rows.FindIndex(x => x.task == t));
+            var result = mine.DoDragDrop(t, DragDropEffects.Move);
+            bool outside = !Bounds.Contains(Cursor.Position);
+            mine.SetPicked(-1);
+            if (result == DragDropEffects.None && outside) app.DiscardTask(t);
             mine.ShowDropLine(-1);
             mine.ClearSelected();
             theirs.BackColor = SystemColors.Window;
@@ -715,7 +840,7 @@ namespace FriendlyFire
         {
             int i = pressed;
             pressed = -1;
-            if (e.Button != MouseButtons.Left || i < 0 || mine.IndexFromPoint(e.Location) != i) return;
+            if (e.Button != MouseButtons.Left || i < 0 || mine.RowAt(e.Location) != i) return;
             var t = mine.TaskAt(i);
             if (t == null) return;
             if (!t.offer) { if (mine.CheckRect(i).Contains(e.Location)) Toggle(t); }
@@ -818,7 +943,34 @@ namespace FriendlyFire
                 };
                 kinds.Controls.Add(box);
             }
-            Action enable = () => { sound.Enabled = kinds.Enabled = all.Checked; };
+            // Pop-ups: extra time on top of the 1–8 s by text length, where they show up and how big
+            Func<string, FlowLayoutPanel> optionRow = name =>
+            {
+                var r = new FlowLayoutPanel { AutoSize = true, Margin = new Padding(0, 2, 0, 0) };
+                r.Controls.Add(new Label { Text = name, AutoSize = true, Width = 120, MinimumSize = new Size(120, 0), Margin = new Padding(3, 7, 6, 0) });
+                return r;
+            };
+            Func<string[], int, Action<int>, ComboBox> pick = (labels, at, set) =>
+            {
+                var c = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 160 };
+                c.Items.AddRange(labels);
+                c.SelectedIndex = Math.Max(0, at);
+                c.SelectedIndexChanged += (s, e) => { set(c.SelectedIndex); app.Save(); };
+                return c;
+            };
+            var extras = new[] { 0, 1, 2, 3, 5, 10, -1 };
+            var stayRow = optionRow("แสดงนาน");
+            stayRow.Controls.Add(pick(new[] { "อัตโนมัติ (1–8 วินาที)", "+1 วินาที", "+2 วินาที", "+3 วินาที", "+5 วินาที", "+10 วินาที", "จนกว่าจะกดปิด" },
+                                      Array.IndexOf(extras, cfg.notifyExtra), i => cfg.notifyExtra = extras[i]));
+            stayRow.Controls.Add(new Label { Text = "(ตามความยาวข้อความ + เวลาที่เพิ่ม)", AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(6, 7, 0, 0) });
+            var placeRow = optionRow("ตำแหน่ง");
+            placeRow.Controls.Add(pick(Notice.PlaceNames, Array.IndexOf(Notice.Places, cfg.notifyPlace), i => cfg.notifyPlace = Notice.Places[i]));
+            var sizeRow = optionRow("ขนาด");
+            sizeRow.Controls.Add(pick(Notice.SizeNames, cfg.notifySize, i => cfg.notifySize = i));
+            var tryIt = new Button { Text = "ลองดูป๊อปอัป", AutoSize = true, Height = 30, Margin = new Padding(12, 3, 0, 0) };
+            tryIt.Click += (s, e) => Notice.Show("🔥 ตัวอย่างป๊อปอัป", "ตำแหน่งและขนาดจะเป็นแบบนี้", emoji => { });
+            sizeRow.Controls.Add(tryIt);
+            Action enable = () => { sound.Enabled = kinds.Enabled = stayRow.Enabled = placeRow.Enabled = sizeRow.Enabled = all.Checked; };
             all.CheckedChanged += (s, e) => { cfg.notifyAll = all.Checked; app.Save(); enable(); };
             sound.CheckedChanged += (s, e) => { cfg.notifySound = sound.Checked; app.Save(); };
             more.LinkClicked += (s, e) => { kinds.Visible = !kinds.Visible; more.Text = kinds.Visible ? "ขั้นสูง ▾" : "ขั้นสูง ▸"; };
@@ -832,7 +984,7 @@ namespace FriendlyFire
                 paused.LinkArea = new LinkArea(paused.Text.Length - "เปิดตอนนี้".Length, "เปิดตอนนี้".Length);
                 paused.LinkClicked += (s, e) => { cfg.notifyMuteUntil = 0; app.Save(); paused.Visible = false; };
             }
-            page.Controls.AddRange(new Control[] { all, paused, sound, more, kinds });
+            page.Controls.AddRange(new Control[] { all, paused, sound, stayRow, placeRow, sizeRow, more, kinds });
 
             // The 4 reaction buttons on a friend's "ทำสำเร็จ" pop-up: pick from the list or type/paste any emoji
             page.Controls.Add(heading("ปุ่มรีแอคชัน"));
@@ -864,6 +1016,19 @@ namespace FriendlyFire
             var start = new CheckBox { Text = "เปิดพร้อม Windows", Checked = cfg.startWithWindows, AutoSize = true, Enabled = !app.TestCopy };
             start.CheckedChanged += (s, e) => app.SetStartup(start.Checked);
             page.Controls.Add(start);
+
+            // How long a finished task stays (yours and the friend's, on this PC) after you've seen it
+            var keepRow = new FlowLayoutPanel { AutoSize = true, Margin = new Padding(0, 6, 0, 0) };
+            keepRow.Controls.Add(new Label { Text = "งานที่เสร็จแล้วหายเองหลังจากเห็น", AutoSize = true, Margin = new Padding(3, 7, 6, 0) });
+            var hours = new[] { 1, 6, 12, 24, 72, 168, 0 };
+            var names = new[] { "1 ชั่วโมง", "6 ชั่วโมง", "12 ชั่วโมง", "1 วัน", "3 วัน", "7 วัน", "ไม่หายเอง" };
+            var keep = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 130 };
+            keep.Items.AddRange(names);
+            int keepAt = Array.IndexOf(hours, cfg.doneKeepHours);
+            keep.SelectedIndex = keepAt >= 0 ? keepAt : 3;
+            keep.SelectedIndexChanged += (s, e) => { cfg.doneKeepHours = hours[keep.SelectedIndex]; app.Save(); app.Tidy(); };
+            keepRow.Controls.Add(keep);
+            page.Controls.Add(keepRow);
 
             // What changed in each version
             page.Controls.Add(heading("บันทึกการอัปเดต  (ตอนนี้ v" + Program.Version + ")"));
@@ -1109,11 +1274,12 @@ namespace FriendlyFire
             if (changed) Save();
         }
 
-        // Remove finished tasks a day after they were seen on this PC
-        void Tidy()
+        // Remove finished tasks some time (Settings, 1 day by default) after they were seen on this PC
+        public void Tidy()
         {
-            long cutoff = Util.NowSec() - 86400;
             foreach (var t in Cfg.tasks) if (t.done && t.seenAt == 0) t.seenAt = t.doneAt;   // from v1.0.0
+            if (Cfg.doneKeepHours <= 0) return;
+            long cutoff = Util.NowSec() - Cfg.doneKeepHours * 3600L;
             int mineGone = Cfg.tasks.RemoveAll(t => t.done && t.seenAt < cutoff);
             var expired = Cfg.friendTasks.Where(t => t.done && t.seenAt > 0 && t.seenAt < cutoff).ToList();
             foreach (var t in expired) HideFriend(t);
@@ -1128,6 +1294,28 @@ namespace FriendlyFire
             Cfg.friendTasks.Remove(t);
             if (!Cfg.friendHidden.Contains(t.id)) Cfg.friendHidden.Add(t.id);
             if (Cfg.friendHidden.Count > 300) Cfg.friendHidden.RemoveRange(0, Cfg.friendHidden.Count - 300);
+        }
+
+        public void HideFriendDone()
+        {
+            foreach (var t in Cfg.friendTasks.Where(x => x.done).ToList()) HideFriend(t);
+            Save();
+            main.FillTheirs();
+        }
+
+        // Dragged out of the window: gone, with a moment to change your mind
+        public void DiscardTask(TaskItem t)
+        {
+            int at = Cfg.tasks.IndexOf(t);
+            if (at < 0) return;
+            Cfg.tasks.RemoveAt(at);
+            Changed("sync", null);
+            Notice.ShowUndo("ทิ้งงานแล้ว 🗑", t.text, () =>
+            {
+                if (Cfg.tasks.Contains(t)) return;
+                Cfg.tasks.Insert(Math.Min(at, Cfg.tasks.Count), t);
+                Changed("sync", null);
+            });
         }
 
         public void HideFriendTask(TaskItem t)
@@ -1288,7 +1476,7 @@ namespace FriendlyFire
 
     static class Program
     {
-        public const string Version = "1.0.6";
+        public const string Version = "1.0.7";
         public static Icon Flame;
         static Mutex mutex;
         public static string RestartArgs = "";   // the same -Data/-Name/-Code after an update
@@ -1297,6 +1485,15 @@ namespace FriendlyFire
 
         // Shown in Settings → บันทึกการอัปเดต (newest first; add a line with each release)
         public const string Changelog =
+            "-----29/10/2569-----\n" +
+            "v1.0.7\n" +
+            "• ชี้เมาส์ที่งานแล้วงานยกขึ้นเล็กน้อย, งานที่ลากอยู่มีสีแดงอ่อน\n" +
+            "• งานที่เสร็จเป็นสีเทา, งานที่เพื่อนส่งมาเป็นสีเขียว\n" +
+            "• ลากงานออกนอกหน้าต่างเพื่อทิ้ง (มีปุ่มเลิกทำ)\n" +
+            "• คลิกขวาฝั่งเพื่อน: ลบงานที่เสร็จแล้วทั้งหมดของเพื่อน\n" +
+            "• ตั้งค่าได้ว่างานที่เสร็จแล้วจะหายเองหลังกี่ชั่วโมง/วัน\n" +
+            "• ป๊อปอัปแสดง 1–8 วินาทีตามความยาวข้อความ และตั้งเวลาเพิ่มได้ (+1 ถึง +10 วินาที หรือจนกว่าจะกดปิด)\n" +
+            "• เลือกตำแหน่ง (มุมจอ/กลางบน/กลางล่าง) และขนาดของป๊อปอัปได้ พร้อมปุ่มลองดู\n\n" +
             "v1.0.6\n" +
             "• ติ๊กเสร็จได้เฉพาะตอนกดในช่องติ๊กเท่านั้น (กันเผลอกด)\n" +
             "• แก้แถบสีค้างหลังลากงานแล้วปล่อย\n\n" +
