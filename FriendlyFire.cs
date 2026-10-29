@@ -53,8 +53,12 @@ namespace FriendlyFire
         public bool notifySound = true;
         public List<string> notifyOff = new List<string> { "accept", "reject" };   // kinds turned off in Settings → ขั้นสูง
         public List<string> reactions = new List<string> { "🔥", "😎", "👍", "❓" };   // the 4 reaction buttons, chosen in Settings
-        public int notifyExtra;                                  // pop-ups stay 1–8 s by text length plus this many seconds (-1 = until closed)
+        public string answerMode = "react";                      // on a friend's pop-up: react (emoji buttons) | reply (type an answer) | none
+        public int notifyExtra;                                  // pop-ups stay 1–8 s by text length plus this many seconds, at least 1 s (Notice.Forever = until closed)
+        public bool stayFixed;                                   // notifyExtra moved from -1 = until closed to Notice.Forever (typed negatives are allowed now)
         public string blockedVersion = "";                       // an update Windows would not run (Smart App Control): not tried again on its own
+        public string themeMode = "light";                       // light | dark | system (Settings → หน้าตา)
+        public string themeColor = "orange";                     // accent: orange blue purple pink mint graphite
         public string notifyPlace = "br";                        // corner/edge: br bl tr tl bc tc
         public int notifySize = 1;                               // 0 small, 1 medium, 2 large
         public int doneKeepHours = 24;                           // finished tasks go away this long after they were seen here (0 = never)
@@ -66,7 +70,7 @@ namespace FriendlyFire
     {
         public string from;    // clientId
         public string name;
-        public string type;    // sync | done | react | give | accept | reject
+        public string type;    // sync | done | react | reply | give | accept | reject
         public string text;
         public long time;      // unix ms, newer lists replace older ones
         public List<TaskItem> tasks;
@@ -282,6 +286,13 @@ namespace FriendlyFire
     {
         // Pop-ups wait their turn; an exact repeat of one showing or waiting is dropped (spam), and ✕ clears the rest
         class Pending { public string Key; public bool Keep; public Action Open; }
+
+        // What the person did on a pop-up: an emoji button (reply = false) or a typed answer (reply = true)
+        public delegate void Answer(string text, bool reply);
+        // "reply" (type an answer on the pop-up, message type "reply") is built but not offered yet: it still needs a real two-PC test.
+        // To turn it on: add "reply" / "ตอบกลับ (พิมพ์ข้อความ)" here and the "reply" row to Kinds
+        public static readonly string[] AnswerModes = { "react", "none" };
+        public static readonly string[] AnswerModeNames = { "รีแอคชัน (ปุ่มอีโมจิ)", "ไม่มี" };
         static readonly List<Pending> waiting = new List<Pending>();
         static Notice current;
         static string currentKey;
@@ -297,7 +308,6 @@ namespace FriendlyFire
             }
         }
         protected override bool ShowWithoutActivation { get { return true; } }
-        static readonly Color Edge = Color.FromArgb(255, 170, 100), Paper = Color.FromArgb(255, 243, 230);
 
         // The kinds of pop-ups you can turn off in Settings (problems and answers to your own clicks always show)
         public static readonly string[][] Kinds =
@@ -320,7 +330,7 @@ namespace FriendlyFire
             return kind == null || Settings == null || (Settings.notifyAll && !Muted && !Settings.notifyOff.Contains(kind));
         }
 
-        public static void Show(string kind, string title, string text, Action<string> react)
+        public static void Show(string kind, string title, string text, Answer react)
         {
             if (!Allowed(kind)) return;
             string key = kind + "|" + title + "|" + text;
@@ -329,7 +339,7 @@ namespace FriendlyFire
             if (current == null || current.IsDisposed) Next();
         }
 
-        public static void Show(string title, string text, Action<string> react) { Show(null, title, text, react); }
+        public static void Show(string title, string text, Answer react) { Show(null, title, text, react); }
 
         // A pop-up with a "↩ เลิกทำ" button (always shown: it answers something you just did)
         public static void ShowUndo(string title, string text, Action undo)
@@ -354,17 +364,17 @@ namespace FriendlyFire
         public static readonly string[] SizeNames = { "เล็ก", "กลาง", "ใหญ่" };
         static readonly float[] Zooms = { 0.85f, 1f, 1.3f };
 
-        static void Open(string kind, string title, string text, Action<string> react, Action undo)
+        static void Open(string kind, string title, string text, Answer react, Action undo)
         {
             float z = Zooms[Settings == null ? 1 : Math.Max(0, Math.Min(2, Settings.notifySize))];
             Func<int, int> S = v => (int)Math.Round(v * z);
             var f = current = new Notice
             {
                 Text = "Friendly Fire", TopMost = true, FormBorderStyle = FormBorderStyle.None, ShowInTaskbar = false,
-                StartPosition = FormStartPosition.Manual, Font = Util.UiFont(10 * z), BackColor = Paper
+                StartPosition = FormStartPosition.Manual, Font = Util.UiFont(10 * z), BackColor = Theme.Paper, ForeColor = Theme.Text
             };
-            f.Paint += (s, e) => { using (var p = new Pen(Edge)) e.Graphics.DrawRectangle(p, 0, 0, f.ClientSize.Width - 1, f.ClientSize.Height - 1); };
-            var head = new Label { Text = title, Font = new Font("Segoe UI", 11 * z, FontStyle.Bold), ForeColor = Color.FromArgb(190, 70, 0),
+            f.Paint += (s, e) => { using (var p = new Pen(Theme.Edge)) e.Graphics.DrawRectangle(p, 0, 0, f.ClientSize.Width - 1, f.ClientSize.Height - 1); };
+            var head = new Label { Text = title, Font = new Font("Segoe UI", 11 * z, FontStyle.Bold), ForeColor = Theme.AccentText,
                                    Location = new Point(S(12), S(10)), AutoSize = true, MaximumSize = new Size(S(320), 0) };
             f.Controls.Add(head);
             int bottom = head.Bottom;
@@ -376,14 +386,36 @@ namespace FriendlyFire
             }
             int right = 0;
             foreach (Control c in f.Controls) right = Math.Max(right, c.Right);
-            if (react != null)
+            // Answer area (Settings → ปุ่มรีแอคชัน): emoji buttons, a reply box, or nothing
+            string answerMode = Settings == null ? "react" : Settings.answerMode;
+            if (Array.IndexOf(AnswerModes, answerMode) < 0) answerMode = "react";   // e.g. "reply" while it is switched off
+            TextBox replyBox = null;
+            if (react != null && answerMode == "reply")
+            {
+                replyBox = new TextBox { Location = new Point(S(12), bottom + S(10)), Width = S(230), MaxLength = 300, Font = Util.UiFont(10 * z),
+                                         BackColor = Theme.Field, ForeColor = Theme.Text, BorderStyle = BorderStyle.FixedSingle };
+                var box = replyBox;
+                box.HandleCreated += (s, e) => Native.SendMessage(box.Handle, 0x1501, (IntPtr)1, "พิมพ์ตอบกลับ แล้วกด Enter");
+                var send = new Button { Text = "ส่ง", Location = new Point(box.Right + S(6), box.Top - 1), Size = new Size(S(60), box.Height + 2), FlatStyle = FlatStyle.Flat,
+                                        BackColor = Theme.AccentButton, ForeColor = Color.White };
+                send.FlatAppearance.BorderColor = Theme.AccentButton;
+                Action go = () => { string v = box.Text.Trim(); if (v == "") { box.Focus(); return; } react(v, true); f.Close(); };
+                send.Click += (s, ev) => go();
+                box.KeyDown += (s, ev) => { if (ev.KeyCode == Keys.Enter) { ev.SuppressKeyPress = true; go(); } };
+                f.Controls.Add(box); f.Controls.Add(send);
+                bottom = box.Bottom + S(2);
+                right = Math.Max(right, send.Right);
+            }
+            if (react != null && answerMode == "react")
             {
                 int x = S(12);
                 foreach (string e in Reactions)
                 {
                     string emoji = e;
                     var b = new Button { Text = emoji, Font = Util.EmojiFont(13 * z), Location = new Point(x, bottom + S(8)), Size = new Size(S(48), S(38)), FlatStyle = FlatStyle.Flat };
-                    b.Click += (s, ev) => { react(emoji); f.Close(); };
+                    b.FlatAppearance.BorderColor = Theme.Mix(Theme.Paper, Theme.Text, 0.35);
+                    b.FlatAppearance.MouseOverBackColor = Theme.Mix(Theme.Paper, Theme.Accent, 0.25);
+                    b.Click += (s, ev) => { react(emoji, false); f.Close(); };
                     f.Controls.Add(b);
                     x += S(54);
                 }
@@ -392,7 +424,7 @@ namespace FriendlyFire
             }
             if (undo != null)
             {
-                var b = new Button { Text = "↩ เลิกทำ", Location = new Point(S(12), bottom + S(8)), Size = new Size(S(110), S(32)), FlatStyle = FlatStyle.Flat, BackColor = Color.White };
+                var b = new Button { Text = "↩ เลิกทำ", Location = new Point(S(12), bottom + S(8)), Size = new Size(S(110), S(32)), FlatStyle = FlatStyle.Flat, BackColor = Theme.Field, ForeColor = Theme.Text };
                 b.Click += (s, ev) => { undo(); f.Close(); };
                 f.Controls.Add(b);
                 bottom += S(8) + S(32);
@@ -400,7 +432,7 @@ namespace FriendlyFire
             }
             int width = Math.Max(right + S(12) + S(56), S(240));   // room on the right for 🔕 and ✕
             f.ClientSize = new Size(width, bottom + S(12));
-            var more = new Label { ForeColor = Color.DimGray, Font = Util.UiFont(8.5f * z), TextAlign = System.Drawing.ContentAlignment.BottomRight,
+            var more = new Label { ForeColor = Theme.Muted, Font = Util.UiFont(8.5f * z), TextAlign = System.Drawing.ContentAlignment.BottomRight,
                                    Size = new Size(S(50), S(18)), Location = new Point(width - S(56), f.ClientSize.Height - S(22)), Visible = false };
             f.Controls.Add(more);
 
@@ -409,6 +441,7 @@ namespace FriendlyFire
             close.Click += (s, e) => { waiting.RemoveAll(w => !w.Keep); f.Close(); };   // one click closes the ones waiting too
             var mute = TopButton("🔕", width - S(58), z);
             var menu = new ContextMenuStrip { Font = Util.UiFont(10) };
+            menu.Opening += (s, e) => Theme.Style(menu);
             menu.Items.Add("ปิดการแจ้งเตือน 1 ชั่วโมง", null, (s, e) => { MuteFor(3600); f.Close(); });
             menu.Items.Add("ปิดการแจ้งเตือน 1 วัน", null, (s, e) => { MuteFor(86400); f.Close(); });
             if (kind != null)
@@ -435,17 +468,21 @@ namespace FriendlyFire
 
             // Every pop-up stays 1–8 s depending on how much there is to read, plus the extra time from Settings
             // (-1 = until closed), then fades out over the last second; hovering (or the mute menu) keeps it
-            int extra = Settings == null ? 0 : Settings.notifyExtra;
-            int stay = extra < 0 ? 0 : AutoSeconds(title, text) + extra;
-            DateTime fadeAt = stay > 0 ? DateTime.Now.AddSeconds(stay) : DateTime.MaxValue;
+            // Read on every tick, so changing the setting also changes a pop-up that is already showing
+            int auto = AutoSeconds(title, text);
+            DateTime shownAt = DateTime.Now, heldUntil = DateTime.MinValue;
             var t = new System.Windows.Forms.Timer { Interval = 50 };
             t.Tick += (s, e) =>
             {
                 if (f.IsDisposed) { t.Dispose(); return; }
-                bool over = f.Bounds.Contains(Cursor.Position) || menu.Visible;
+                bool over = f.Bounds.Contains(Cursor.Position) || menu.Visible || (replyBox != null && (replyBox.Focused || replyBox.Text != ""));   // stays while you type
                 close.Visible = over; mute.Visible = over && Settings != null;
                 more.Text = "+" + waiting.Count + " รอ"; more.Visible = waiting.Count > 0;
-                if (over) { if (stay > 0) fadeAt = DateTime.Now.AddSeconds(3); f.Opacity = 1; return; }
+                if (over) { heldUntil = DateTime.Now.AddSeconds(3); f.Opacity = 1; return; }
+                int extra = Settings == null ? 0 : Settings.notifyExtra;
+                if (extra == Forever) { f.Opacity = 1; return; }
+                DateTime fadeAt = shownAt.AddSeconds(Math.Max(1, auto + extra));   // never less than 1 s
+                if (heldUntil > fadeAt) fadeAt = heldUntil;
                 double into = (DateTime.Now - fadeAt).TotalSeconds;
                 if (into < 0) return;
                 if (into >= 1) { t.Dispose(); f.Close(); return; }
@@ -455,6 +492,17 @@ namespace FriendlyFire
             f.Show();
             PlaySound();
         }
+        public const int Forever = -1000;   // Settings → แสดงนาน → จนกว่าจะกดปิด
+
+        // Settings → ลองดูป๊อปอัป: always shows (even when muted) and replaces the last try, so it shows the settings as they are now
+        public static void Preview()
+        {
+            waiting.RemoveAll(w => w.Key == "preview");
+            if (current != null && !current.IsDisposed && currentKey == "preview") current.Close();
+            waiting.Insert(0, new Pending { Key = "preview", Open = () => Open(null, "🔥 ตัวอย่างป๊อปอัป", "ตำแหน่ง ขนาด และเวลาแสดงจะเป็นแบบนี้", (v, r) => { }, null) });
+            if (current == null || current.IsDisposed) Next();
+        }
+
         // Auto: about the time it takes to read it, 1 s at least and 8 s at most
         static int AutoSeconds(string title, string text)
         {
@@ -464,9 +512,9 @@ namespace FriendlyFire
 
         static Label TopButton(string text, int x, float z)
         {
-            var b = new Label { Text = text, Font = Util.EmojiFont(10 * z), ForeColor = Color.DimGray, TextAlign = System.Drawing.ContentAlignment.MiddleCenter,
+            var b = new Label { Text = text, Font = Util.EmojiFont(10 * z), ForeColor = Theme.Muted, TextAlign = System.Drawing.ContentAlignment.MiddleCenter,
                                 Location = new Point(x, (int)(4 * z)), Size = new Size((int)(26 * z), (int)(24 * z)), Cursor = Cursors.Hand };
-            b.MouseEnter += (s, e) => b.BackColor = Color.FromArgb(255, 220, 190);
+            b.MouseEnter += (s, e) => b.BackColor = Theme.Mix(Theme.Paper, Theme.Accent, 0.3);
             b.MouseLeave += (s, e) => b.BackColor = Color.Transparent;
             return b;
         }
@@ -487,6 +535,147 @@ namespace FriendlyFire
             }
             catch { }
         }
+    }
+
+    // ---------- look: light / dark and the accent colour (Settings → หน้าตา) ----------
+
+    static class Theme
+    {
+        public static readonly string[] Modes = { "light", "dark", "system" };
+        public static readonly string[] ModeNames = { "สว่าง", "มืด", "ตาม Windows" };
+        public static readonly string[] Accents = { "orange", "blue", "purple", "pink", "mint", "graphite" };
+        public static readonly string[] AccentNames = { "ส้มไฟ", "ฟ้าทะเล", "ม่วงลาเวนเดอร์", "ชมพูซากุระ", "เขียวมิ้นต์", "เทากราไฟต์" };
+        public static readonly Color[] AccentColors = { Color.FromArgb(255, 140, 40), Color.FromArgb(40, 130, 230), Color.FromArgb(140, 95, 225),
+                                                        Color.FromArgb(232, 85, 150), Color.FromArgb(25, 170, 140), Color.FromArgb(105, 112, 125) };
+
+        // Dark mode: mixing these with white looked washed out, so they get their own vivid text and deeper button tones
+        // (purple and graphite looked right mixed, so they stay that way: Empty)
+        static readonly Color[] DarkText = { Color.FromArgb(255, 152, 60), Color.FromArgb(85, 165, 255), Color.Empty,
+                                             Color.FromArgb(255, 112, 172), Color.FromArgb(50, 210, 170), Color.Empty };
+        static readonly Color[] DarkButton = { Color.FromArgb(235, 120, 25), Color.FromArgb(30, 115, 225), Color.Empty,
+                                               Color.FromArgb(220, 65, 135), Color.FromArgb(20, 155, 125), Color.Empty };
+
+        public static bool Dark;
+        public static Color AccentButton;
+        public static Color Accent, AccentText, AccentSoft, Back, Field, Text, Muted, Line, Card, CardEdge, Done, Wait,
+                            Gift, GiftText, Pick, PickOut, PickEdge, Sel, Paper, Edge, Online, Button;
+
+        public static event Action Changed;   // open windows colour themselves again
+
+        public static void Set(string mode, string accent)
+        {
+            Dark = mode == "dark" || (mode == "system" && WindowsDark());
+            int at = Math.Max(0, Array.IndexOf(Accents, accent));
+            Accent = AccentButton = AccentColors[at];
+            if (Dark)
+            {
+                Back = Rgb(32, 32, 32); Field = Rgb(43, 43, 43); Text = Rgb(235, 235, 235); Muted = Rgb(160, 160, 160); Line = Rgb(56, 56, 56);
+                Card = Rgb(58, 58, 58); CardEdge = Rgb(78, 78, 78); Done = Rgb(52, 52, 52); Wait = Rgb(50, 50, 50);
+                Gift = Rgb(36, 68, 46); GiftText = Rgb(140, 220, 160); Pick = Rgb(92, 48, 48); PickOut = Rgb(125, 48, 42); PickEdge = Rgb(190, 95, 85);
+                Online = Rgb(110, 210, 130); Button = Rgb(55, 55, 55);
+                AccentText = DarkText[at].IsEmpty ? Mix(Accent, Color.White, 0.3) : DarkText[at];
+                if (!DarkButton[at].IsEmpty) AccentButton = DarkButton[at];
+                AccentSoft = Mix(Field, Accent, 0.16); Sel = Mix(Field, Accent, 0.24);
+                Paper = Mix(Rgb(40, 40, 42), Accent, 0.05); Edge = Accent;   // a near-neutral pop-up: a strong tint turned brown/muddy
+            }
+            else
+            {
+                Back = SystemColors.Control; Field = Color.White; Text = Rgb(25, 25, 25); Muted = Color.DimGray; Line = Rgb(238, 238, 238);
+                Card = Color.White; CardEdge = Rgb(228, 228, 228); Done = Rgb(236, 236, 236); Wait = Rgb(234, 234, 234);
+                Gift = Rgb(220, 244, 225); GiftText = Rgb(25, 110, 45); Pick = Rgb(255, 222, 220); PickOut = Rgb(255, 200, 195); PickEdge = Rgb(240, 150, 140);
+                Online = Rgb(30, 130, 60); Button = Color.White;
+                AccentText = Mix(Accent, Color.Black, 0.28); AccentSoft = Mix(Field, Accent, 0.1); Sel = Mix(Field, Accent, 0.16);
+                Paper = Mix(Color.White, Accent, 0.1); Edge = Mix(Color.White, Accent, 0.65);
+            }
+            if (Changed != null) Changed();
+        }
+
+        static Color Rgb(int r, int g, int b) { return Color.FromArgb(r, g, b); }
+        public static Color Mix(Color a, Color b, double t) { return Color.FromArgb((int)(a.R + (b.R - a.R) * t), (int)(a.G + (b.G - a.G) * t), (int)(a.B + (b.B - a.B) * t)); }
+
+        static bool WindowsDark()
+        {
+            try
+            {
+                using (var k = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"))
+                {
+                    object v = k == null ? null : k.GetValue("AppsUseLightTheme");
+                    return v is int && (int)v == 0;
+                }
+            }
+            catch { return false; }
+        }
+
+        // Colours a window and everything in it. Tags: "heading" / "muted" labels, "accent" button, "swatch" = leave alone
+        public static void Apply(Control c)
+        {
+            string tag = c.Tag as string;
+            if (tag == "swatch") return;
+            if (c is Form) { c.BackColor = Back; c.ForeColor = Text; TitleBar((Form)c); }
+            else if (c is ListBox) { c.BackColor = Field; c.ForeColor = Text; c.Invalidate(); }
+            else if (c is TextBox) { var tb = (TextBox)c; tb.BorderStyle = Dark ? BorderStyle.FixedSingle : BorderStyle.Fixed3D; c.BackColor = Field; c.ForeColor = Text; }   // the 3D edge is bright white on dark
+            else if (c is ComboBox) { ((ComboBox)c).FlatStyle = Dark ? FlatStyle.Flat : FlatStyle.Standard; c.BackColor = Field; c.ForeColor = Text; }
+            else if (c is System.Windows.Forms.Button)
+            {
+                var b = (System.Windows.Forms.Button)c;
+                bool accent = tag == "accent";
+                b.FlatStyle = FlatStyle.Flat;
+                b.BackColor = accent ? AccentButton : Button;
+                b.ForeColor = accent ? Color.White : Text;
+                b.FlatAppearance.BorderColor = accent ? AccentButton : Dark ? Rgb(90, 90, 90) : Color.Silver;
+                b.FlatAppearance.MouseOverBackColor = accent ? Mix(AccentButton, Color.White, 0.15) : Mix(Button, Accent, 0.15);
+                b.FlatAppearance.MouseDownBackColor = accent ? Mix(AccentButton, Color.Black, 0.1) : Mix(Button, Accent, 0.28);
+            }
+            else if (c is LinkLabel) { var l = (LinkLabel)c; l.ForeColor = Text; l.LinkColor = AccentText; l.ActiveLinkColor = Accent; }
+            else if (c is Label) c.ForeColor = tag == "heading" ? AccentText : tag == "muted" ? Muted : Text;
+            else if (c is CheckBox || c is RadioButton || c is GroupBox) c.ForeColor = Text;
+            if (c.ContextMenuStrip != null) Style(c.ContextMenuStrip);
+            foreach (Control k in c.Controls) Apply(k);
+        }
+
+        // Right-click menus in the same colours
+        public static void Style(ToolStripDropDown m)
+        {
+            m.Renderer = new ToolStripProfessionalRenderer(new MenuColors());
+            m.BackColor = Field; m.ForeColor = Text;
+            foreach (ToolStripItem i in m.Items) i.ForeColor = Text;
+        }
+
+        class MenuColors : ProfessionalColorTable
+        {
+            public override Color ToolStripDropDownBackground { get { return Field; } }
+            public override Color ImageMarginGradientBegin { get { return Field; } }
+            public override Color ImageMarginGradientMiddle { get { return Field; } }
+            public override Color ImageMarginGradientEnd { get { return Field; } }
+            public override Color MenuBorder { get { return Dark ? Rgb(70, 70, 70) : Rgb(200, 200, 200); } }
+            public override Color MenuItemBorder { get { return Mix(Field, Accent, 0.5); } }
+            public override Color MenuItemSelected { get { return Sel; } }
+            public override Color SeparatorDark { get { return Line; } }
+            public override Color SeparatorLight { get { return Line; } }
+            public override Color CheckBackground { get { return Sel; } }
+            public override Color CheckSelectedBackground { get { return Sel; } }
+            public override Color CheckPressedBackground { get { return Sel; } }
+        }
+
+        [System.Runtime.InteropServices.DllImport("dwmapi.dll")]
+        static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+
+        // Dark title bar too (Windows 10 2004+ / 11)
+        public static void TitleBar(Form f)
+        {
+            if (!f.IsHandleCreated) { f.HandleCreated -= TitleBarLater; f.HandleCreated += TitleBarLater; return; }
+            int v = Dark ? 1 : 0;
+            try
+            {
+                DwmSetWindowAttribute(f.Handle, 20, ref v, 4);
+                SetWindowPos(f.Handle, IntPtr.Zero, 0, 0, 0, 0, 0x0027);   // NOSIZE | NOMOVE | NOZORDER | FRAMECHANGED: repaint the frame now
+            }
+            catch { }
+        }
+
+        static void TitleBarLater(object s, EventArgs e) { TitleBar((Form)s); }
     }
 
     // ---------- first run: name + pair ----------
@@ -511,6 +700,7 @@ namespace FriendlyFire
             ok.Click += (s, e) => Done();
             Controls.AddRange(new Control[] { nameBox, create, join, codeBox, ok });
             AcceptButton = ok;
+            Theme.Apply(this);
         }
 
         void Done()
@@ -549,7 +739,7 @@ namespace FriendlyFire
         const int TextLeft = 32, Btn = 26;
         const TextFormatFlags Wrap = TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl | TextFormatFlags.NoPrefix;
         const TextFormatFlags Keep = TextFormatFlags.PreserveGraphicsTranslateTransform;   // rows are drawn into an off-screen buffer that is shifted
-        static readonly Color Green = Color.FromArgb(40, 160, 70), Red = Color.FromArgb(215, 60, 50), Orange = Color.FromArgb(255, 140, 40);
+        static readonly Color Green = Color.FromArgb(40, 160, 70), Red = Color.FromArgb(215, 60, 50);
         int lastWidth;
 
         public TaskList()
@@ -595,8 +785,6 @@ namespace FriendlyFire
         public int Picked = -1;   // row being dragged: lifted, with a light red cover
         public bool PickedOut;    // the dragged row is outside the window: letting go throws it away
 
-        static readonly Color DoneBack = Color.FromArgb(236, 236, 236), GiftBack = Color.FromArgb(220, 244, 225),
-                              WaitBack = Color.FromArgb(234, 234, 234), PickBack = Color.FromArgb(255, 222, 220), SelBack = Color.FromArgb(255, 238, 220);
 
         // Each row is drawn off-screen first and then copied in one go, so it never shows half-drawn
         protected override void OnDrawItem(DrawItemEventArgs e)
@@ -615,7 +803,7 @@ namespace FriendlyFire
             var b = e.Bounds;
             bool sel = ShowSelection && (e.State & DrawItemState.Selected) != 0 && r.task != null;
             bool picked = Picked == e.Index, lifted = r.task != null && (picked || Hot == e.Index);
-            Color back = picked ? (PickedOut ? Color.FromArgb(255, 200, 195) : PickBack) : sel ? SelBack : r.buttons ? GiftBack : r.grey ? WaitBack : r.task != null && r.task.done ? DoneBack : BackColor;
+            Color back = picked ? (PickedOut ? Theme.PickOut : Theme.Pick) : sel ? Theme.Sel : r.buttons ? Theme.Gift : r.grey ? Theme.Wait : r.task != null && r.task.done ? Theme.Done : BackColor;
             using (var br = new SolidBrush(BackColor)) g.FillRectangle(br, b);
 
             int up = 0;   // lifted rows move up a little and get a shadow, like a card picked off the table
@@ -630,15 +818,15 @@ namespace FriendlyFire
                     using (var sh = new SolidBrush(Color.FromArgb(alpha * (layers + 1 - k), 0, 0, 0))) g.FillPath(sh, path);
                 using (var path = Round(card, 7))
                 {
-                    using (var br = new SolidBrush(back == BackColor ? Color.White : back)) g.FillPath(br, path);
-                    using (var pen = new Pen(picked ? Color.FromArgb(240, 150, 140) : Color.FromArgb(228, 228, 228))) g.DrawPath(pen, path);
+                    using (var br = new SolidBrush(back == BackColor ? Theme.Card : back)) g.FillPath(br, path);
+                    using (var pen = new Pen(picked ? Theme.PickEdge : Theme.CardEdge)) g.DrawPath(pen, path);
                 }
                 g.SmoothingMode = SmoothingMode.Default;
             }
             else
             {
                 if (back != BackColor) using (var br = new SolidBrush(back)) g.FillRectangle(br, b.X + 3, b.Y + 1, b.Width - 7, b.Height - 3);
-                using (var p = new Pen(Color.FromArgb(238, 238, 238))) g.DrawLine(p, b.X + 6, b.Bottom - 1, b.Right - 6, b.Bottom - 1);
+                using (var p = new Pen(Theme.Line)) g.DrawLine(p, b.X + 6, b.Bottom - 1, b.Right - 6, b.Bottom - 1);
             }
 
             int top = b.Y - up, lineY = top + 6;   // the first text line; marks and buttons line up with it
@@ -649,12 +837,12 @@ namespace FriendlyFire
             else if (r.buttons)
                 TextRenderer.DrawText(g, "🎁", Font, new Rectangle(b.X + 4, lineY, 26, 22), Green, TextFormatFlags.HorizontalCenter | TextFormatFlags.NoPrefix | Keep);
 
-            Color fore = r.task == null || r.grey || r.task.done ? Color.Gray : r.buttons ? Color.FromArgb(25, 110, 45) : ForeColor;
+            Color fore = r.task == null || r.grey || r.task.done ? Color.Gray : r.buttons ? Theme.GiftText : ForeColor;
             TextRenderer.DrawText(g, r.text, Font, new Rectangle(b.X + TextLeft, lineY, TextWidth(r), b.Height - 6), fore, Wrap | Keep);
 
             if (r.tag != null)
                 using (var small = Util.UiFont(8.5f))
-                    TextRenderer.DrawText(g, r.tag, small, new Rectangle(b.Right - 68, lineY + 2, 62, 20), Color.DimGray, TextFormatFlags.Right | TextFormatFlags.NoPrefix | Keep);
+                    TextRenderer.DrawText(g, r.tag, small, new Rectangle(b.Right - 68, lineY + 2, 62, 20), Theme.Muted, TextFormatFlags.Right | TextFormatFlags.NoPrefix | Keep);
 
             if (r.buttons)
             {
@@ -675,7 +863,7 @@ namespace FriendlyFire
                 }
 
             if (DropLine == e.Index || (DropLine == Rows.Count && e.Index == Rows.Count - 1))
-                using (var br = new SolidBrush(Orange)) g.FillRectangle(br, b.X + 2, DropLine == e.Index ? b.Y : b.Bottom - 3, b.Width - 4, 3);
+                using (var br = new SolidBrush(Theme.Accent)) g.FillRectangle(br, b.X + 2, DropLine == e.Index ? b.Y : b.Bottom - 3, b.Width - 4, 3);
         }
 
         static GraphicsPath Round(Rectangle r, int radius)
@@ -782,16 +970,15 @@ namespace FriendlyFire
             StartPosition = FormStartPosition.CenterScreen; MinimumSize = new Size(560, 380);
 
             var top = new Panel { Dock = DockStyle.Top, Height = 34, Padding = new Padding(0, 4, 10, 0) };
-            var gear = new Button { Text = "⚙ ตั้งค่า", Dock = DockStyle.Right, Width = 96, FlatStyle = FlatStyle.Flat };
-            gear.FlatAppearance.BorderColor = Color.Silver;
+            var gear = new Button { Text = "⚙ ตั้งค่า", Dock = DockStyle.Right, Width = 96 };
             gear.Click += (s, e) => app.ShowSettings();
-            status.Dock = DockStyle.Fill; status.Padding = new Padding(10, 4, 0, 0); status.ForeColor = Color.DimGray;
+            status.Dock = DockStyle.Fill; status.Padding = new Padding(10, 4, 0, 0);
             top.Controls.Add(status); top.Controls.Add(gear);
 
             // Bottom: tell the friend about anything you finished
             var bottom = new Panel { Dock = DockStyle.Bottom, Height = 54, Padding = new Padding(10, 8, 10, 10) };
             var bragBtn = new Button { Text = "เสร็จแล้ว! 🎉", Dock = DockStyle.Right, Width = 150, Font = new Font("Segoe UI", 11, FontStyle.Bold),
-                                       BackColor = Color.FromArgb(255, 140, 40), ForeColor = Color.White, FlatStyle = FlatStyle.Flat };
+                                       Tag = "accent" };
             brag.Dock = DockStyle.Fill; brag.Font = Util.UiFont(12);
             SetCue(brag, "ทำอะไรเสร็จ? เช่น อ่านฟิสิกส์จบบท 3");
             bragBtn.Click += (s, e) => Brag();
@@ -860,10 +1047,10 @@ namespace FriendlyFire
                 var t = Dragged(e);
                 bool ok = t != null && !t.done;
                 e.Effect = ok ? DragDropEffects.Move : DragDropEffects.None;
-                theirs.BackColor = ok ? Color.FromArgb(255, 244, 232) : SystemColors.Window;
+                theirs.BackColor = ok ? Theme.AccentSoft : Theme.Field;
             };
-            theirs.DragLeave += (s, e) => theirs.BackColor = SystemColors.Window;
-            theirs.DragDrop += (s, e) => { theirs.BackColor = SystemColors.Window; var t = Dragged(e); if (t != null && !t.done) app.GiveTask(t); };
+            theirs.DragLeave += (s, e) => theirs.BackColor = Theme.Field;
+            theirs.DragDrop += (s, e) => { theirs.BackColor = Theme.Field; var t = Dragged(e); if (t != null && !t.done) app.GiveTask(t); };
             theirBox.Controls.Add(theirs);
             Activated += (s, e) => app.MarkSeen(true);
 
@@ -872,7 +1059,10 @@ namespace FriendlyFire
 
             FormClosing += (s, e) => { if (!Exiting && e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; Hide(); } };
             FillMine(); FillTheirs(); SetStatus(false);
+            Retheme();
         }
+
+        public void Retheme() { Theme.Apply(this); SetStatus(online); }
 
         // Grey hint text inside an empty text box
         static void SetCue(TextBox box, string cue)
@@ -908,7 +1098,7 @@ namespace FriendlyFire
             if (result == DragDropEffects.None && outside) app.DiscardTask(t);
             mine.ShowDropLine(-1);
             mine.ClearSelected();
-            theirs.BackColor = SystemColors.Window;
+            theirs.BackColor = Theme.Field;
         }
 
         // A click without a drag: tick / untick, or the ✓ / ✗ of a gift
@@ -979,10 +1169,12 @@ namespace FriendlyFire
 
         public bool Watching { get { return Visible && WindowState != FormWindowState.Minimized && Form.ActiveForm == this; } }
 
+        bool online;
         public void SetStatus(bool online)
         {
+            this.online = online;
             status.Text = (online ? "● เชื่อมต่อแล้ว" : "○ กำลังเชื่อมต่อ...") + "   ·   คุณ: " + app.Cfg.name + "   ·   เพื่อน: " + app.FriendLabel + "   ·   v" + Program.Version;
-            status.ForeColor = online ? Color.FromArgb(30, 130, 60) : Color.DimGray;
+            status.ForeColor = online ? Theme.Online : Theme.Muted;
         }
     }
 
@@ -999,7 +1191,46 @@ namespace FriendlyFire
 
             var page = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoSize = true, Dock = DockStyle.Fill };
             Controls.Add(page);
-            Func<string, Label> heading = s => new Label { Text = s, AutoSize = true, Font = new Font("Segoe UI", 11.5f, FontStyle.Bold), ForeColor = Color.FromArgb(190, 70, 0), Margin = new Padding(0, 10, 0, 4) };
+            Func<string, Label> heading = s => new Label { Text = s, AutoSize = true, Font = new Font("Segoe UI", 11.5f, FontStyle.Bold), Tag = "heading", Margin = new Padding(0, 10, 0, 4) };
+
+            // Look: light / dark / follow Windows, and the accent colour
+            page.Controls.Add(heading("หน้าตา"));
+            var modeRow = new FlowLayoutPanel { AutoSize = true, Margin = new Padding(0, 2, 0, 0) };
+            modeRow.Controls.Add(new Label { Text = "โหมด", AutoSize = true, MinimumSize = new Size(120, 0), Margin = new Padding(3, 7, 6, 0) });
+            var mode = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 160 };
+            mode.Items.AddRange(Theme.ModeNames);
+            mode.SelectedIndex = Math.Max(0, Array.IndexOf(Theme.Modes, cfg.themeMode));
+            mode.SelectedIndexChanged += (s, e) => { cfg.themeMode = Theme.Modes[mode.SelectedIndex]; app.SetTheme(); };
+            modeRow.Controls.Add(mode);
+            var colorRow = new FlowLayoutPanel { AutoSize = true, Margin = new Padding(0, 4, 0, 0) };
+            colorRow.Controls.Add(new Label { Text = "สีธีม", AutoSize = true, MinimumSize = new Size(120, 0), Margin = new Padding(3, 8, 6, 0) });
+            var tips = new ToolTip();
+            var swatches = new List<Button>();
+            var colorName = new Label { AutoSize = true, Tag = "muted", Margin = new Padding(6, 8, 0, 0) };
+            for (int i = 0; i < Theme.Accents.Length; i++)
+            {
+                int at = i;
+                var sw = new Button { Tag = "swatch", Size = new Size(30, 30), FlatStyle = FlatStyle.Flat, BackColor = Theme.AccentColors[at],
+                                      Margin = new Padding(2, 2, 4, 0), Cursor = Cursors.Hand };
+                sw.FlatAppearance.MouseOverBackColor = Theme.Mix(Theme.AccentColors[at], Color.White, 0.15);
+                sw.FlatAppearance.MouseDownBackColor = Theme.AccentColors[at];
+                tips.SetToolTip(sw, Theme.AccentNames[at]);
+                sw.Click += (s, e) => { cfg.themeColor = Theme.Accents[at]; app.SetTheme(); };
+                swatches.Add(sw);
+                colorRow.Controls.Add(sw);
+            }
+            colorRow.Controls.Add(colorName);
+            paintSwatches = () =>
+            {
+                int on = Math.Max(0, Array.IndexOf(Theme.Accents, cfg.themeColor));
+                for (int i = 0; i < swatches.Count; i++)
+                {
+                    swatches[i].FlatAppearance.BorderSize = i == on ? 3 : 1;
+                    swatches[i].FlatAppearance.BorderColor = i == on ? Theme.Text : Theme.Mix(Theme.Back, Theme.Text, 0.25);
+                }
+                colorName.Text = Theme.AccentNames[on];
+            };
+            page.Controls.Add(modeRow); page.Controls.Add(colorRow);
 
             // Pop-ups: all on/off, sound, and each kind under "ขั้นสูง"
             page.Controls.Add(heading("การแจ้งเตือน"));
@@ -1034,17 +1265,37 @@ namespace FriendlyFire
                 c.SelectedIndexChanged += (s, e) => { set(c.SelectedIndex); app.Save(); };
                 return c;
             };
-            var extras = new[] { 0, 1, 2, 3, 5, 10, -1 };
+            // Pick one, or type any number of seconds to add (or take away, e.g. -2): a pop-up still shows at least 1 s
+            var extras = new[] { 0, 1, 2, 3, 5, 10, Notice.Forever };
+            var stayNames = new[] { "อัตโนมัติ (1–8 วินาที)", "+1 วินาที", "+2 วินาที", "+3 วินาที", "+5 วินาที", "+10 วินาที", "จนกว่าจะกดปิด" };
             var stayRow = optionRow("แสดงนาน");
-            stayRow.Controls.Add(pick(new[] { "อัตโนมัติ (1–8 วินาที)", "+1 วินาที", "+2 วินาที", "+3 วินาที", "+5 วินาที", "+10 วินาที", "จนกว่าจะกดปิด" },
-                                      Array.IndexOf(extras, cfg.notifyExtra), i => cfg.notifyExtra = extras[i]));
-            stayRow.Controls.Add(new Label { Text = "(ตามความยาวข้อความ + เวลาที่เพิ่ม)", AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(6, 7, 0, 0) });
+            var stay = new ComboBox { DropDownStyle = ComboBoxStyle.DropDown, Width = 160 };
+            stay.Items.AddRange(stayNames);
+            Action showStay = () =>
+            {
+                int at = Array.IndexOf(extras, cfg.notifyExtra);
+                if (at >= 0) stay.SelectedIndex = at;
+                else { stay.SelectedIndex = -1; stay.Text = (cfg.notifyExtra > 0 ? "+" : "") + cfg.notifyExtra + " วินาที"; }
+            };
+            Action typed = () =>
+            {
+                int v;
+                string x = stay.Text.Replace("วินาที", "").Replace(" ", "").Replace("+", "");
+                if (Array.IndexOf(stayNames, stay.Text) < 0 && int.TryParse(x, out v)) { cfg.notifyExtra = Math.Max(-60, Math.Min(3600, v)); app.Save(); }
+                showStay();
+            };
+            showStay();
+            stay.SelectionChangeCommitted += (s, e) => { if (stay.SelectedIndex >= 0) { cfg.notifyExtra = extras[stay.SelectedIndex]; app.Save(); } };
+            stay.Leave += (s, e) => typed();
+            stay.KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; typed(); } };
+            stayRow.Controls.Add(stay);
+            stayRow.Controls.Add(new Label { Text = "(พิมพ์เองได้ เช่น +4 หรือ -2 · อย่างน้อย 1 วินาที)", AutoSize = true, Tag = "muted", Margin = new Padding(6, 7, 0, 0) });
             var placeRow = optionRow("ตำแหน่ง");
             placeRow.Controls.Add(pick(Notice.PlaceNames, Array.IndexOf(Notice.Places, cfg.notifyPlace), i => cfg.notifyPlace = Notice.Places[i]));
             var sizeRow = optionRow("ขนาด");
             sizeRow.Controls.Add(pick(Notice.SizeNames, cfg.notifySize, i => cfg.notifySize = i));
             var tryIt = new Button { Text = "ลองดูป๊อปอัป", AutoSize = true, Height = 30, Margin = new Padding(12, 3, 0, 0) };
-            tryIt.Click += (s, e) => Notice.Show("🔥 ตัวอย่างป๊อปอัป", "ตำแหน่งและขนาดจะเป็นแบบนี้", emoji => { });
+            tryIt.Click += (s, e) => Notice.Preview();
             sizeRow.Controls.Add(tryIt);
             Action enable = () => { sound.Enabled = kinds.Enabled = stayRow.Enabled = placeRow.Enabled = sizeRow.Enabled = all.Checked; };
             all.CheckedChanged += (s, e) => { cfg.notifyAll = all.Checked; app.Save(); enable(); };
@@ -1062,9 +1313,15 @@ namespace FriendlyFire
             }
             page.Controls.AddRange(new Control[] { all, paused, sound, stayRow, placeRow, sizeRow, more, kinds });
 
-            // The 4 reaction buttons on a friend's "ทำสำเร็จ" pop-up: pick from the list or type/paste any emoji
+            // What a friend's "ทำสำเร็จ" pop-up offers: the 4 reaction buttons (pick from the list or type/paste any emoji),
+            // a box to type a reply, or nothing
             page.Controls.Add(heading("ปุ่มรีแอคชัน"));
-            page.Controls.Add(new Label { Text = "เลือกจากรายการ หรือพิมพ์/วางอีโมจิเองก็ได้", AutoSize = true, ForeColor = Color.DimGray });
+            var answerRow = optionRow("บนป๊อปอัป");
+            answerRow.Controls.Add(pick(Notice.AnswerModeNames, Array.IndexOf(Notice.AnswerModes, cfg.answerMode), i => { cfg.answerMode = Notice.AnswerModes[i]; showAnswer(); }));
+            page.Controls.Add(answerRow);
+            var emojiHint = new Label { Text = "เลือกจากรายการ หรือพิมพ์/วางอีโมจิเองก็ได้", AutoSize = true, Tag = "muted" };
+            var replyHint = new Label { Text = "ป๊อปอัปจะมีช่องพิมพ์ตอบกลับ กด Enter หรือ ส่ง แล้วเพื่อนจะเห็นข้อความ (ตอบกลับไปมาได้)", AutoSize = true, Tag = "muted", MaximumSize = new Size(440, 0) };
+            page.Controls.Add(emojiHint); page.Controls.Add(replyHint);
             var slots = new FlowLayoutPanel { AutoSize = true, Margin = new Padding(0, 4, 0, 0) };
             var choices = new object[] { "🔥", "😎", "👍", "❓", "😂", "🤣", "😭", "😱", "🤯", "🥳", "💀", "🫡", "🙏", "👏", "💪", "❤️", "💯", "🎉", "🤔", "😵‍💫", "🐐", "👀", "🫠", "😴", "⭐", "🚀" };
             while (cfg.reactions.Count < 4) cfg.reactions.Add(Notice.DefaultReactions[cfg.reactions.Count]);
@@ -1087,6 +1344,8 @@ namespace FriendlyFire
             reset.LinkClicked += (s, e) => { for (int i = 0; i < 4; i++) slots.Controls[i].Text = Notice.DefaultReactions[i]; };
             slots.Controls.Add(reset);
             page.Controls.Add(slots);
+            showAnswer = () => { emojiHint.Visible = slots.Visible = cfg.answerMode == "react"; replyHint.Visible = cfg.answerMode == "reply"; };
+            showAnswer();
 
             page.Controls.Add(heading("ทั่วไป"));
             var start = new CheckBox { Text = "เปิดพร้อม Windows", Checked = cfg.startWithWindows, AutoSize = true, Enabled = !app.TestCopy };
@@ -1109,7 +1368,7 @@ namespace FriendlyFire
             // What changed in each version
             page.Controls.Add(heading("บันทึกการอัปเดต  (ตอนนี้ v" + Program.Version + ")"));
             var log = new TextBox { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical, Width = 440, Height = 190,
-                                    Text = Program.Changelog.Replace("\n", "\r\n"), BackColor = SystemColors.Window, Font = Util.UiFont(10) };
+                                    Text = Program.Changelog.Replace("\n", "\r\n"), Font = Util.UiFont(10) };
             page.Controls.Add(log);
 
             var row = new FlowLayoutPanel { AutoSize = true, Margin = new Padding(0, 10, 0, 0) };
@@ -1121,7 +1380,11 @@ namespace FriendlyFire
             page.Controls.Add(row);
             CancelButton = close;
             Shown += (s, e) => log.Select(0, 0);
+            Retheme();
         }
+
+        Action paintSwatches, showAnswer;
+        public void Retheme() { Theme.Apply(this); if (paintSwatches != null) paintSwatches(); }
     }
 
     static class Native
@@ -1157,6 +1420,8 @@ namespace FriendlyFire
             cfgPath = Path.Combine(dataDir, "friendlyfire.json");
             Cfg = File.Exists(cfgPath) ? Util.Json.Deserialize<Config>(File.ReadAllText(cfgPath, Encoding.UTF8)) : new Config();
             if (Cfg.clientId == "") Cfg.clientId = Util.RandomCode(12);
+            Theme.Set(Cfg.themeMode, Cfg.themeColor);
+            if (!Cfg.stayFixed) { if (Cfg.notifyExtra == -1) Cfg.notifyExtra = Notice.Forever; Cfg.stayFixed = true; }
             ui.CreateControl();
 
             // First run: name and pair (or from the command line, for testing)
@@ -1194,6 +1459,10 @@ namespace FriendlyFire
             tray.Icon = Program.Flame;
             tray.Text = "Friendly Fire" + (testCopy ? " (" + Cfg.name + ")" : "");
             tray.ContextMenuStrip = menu;
+            Theme.Style(menu);
+            Theme.Changed += () => { main.Retheme(); if (settings != null && !settings.IsDisposed) settings.Retheme(); Theme.Style(menu); };
+            // "ตาม Windows": follow Windows when it switches between light and dark
+            SystemEvents.UserPreferenceChanged += (s, e) => { if (Cfg.themeMode == "system") ui.BeginInvoke((Action)(() => Theme.Set(Cfg.themeMode, Cfg.themeColor))); };
             tray.DoubleClick += (s, e) => ShowMain();
             tray.Visible = true;
 
@@ -1307,17 +1576,23 @@ namespace FriendlyFire
 
             string when = Util.NowSec() - time > 300 ? "  (" + Util.Local(time).ToString("HH:mm", CultureInfo.InvariantCulture) + ")" : "";
             if (m.type == "done")
-                Notice.Show("done", "🔥 " + FriendLabel + " ทำสำเร็จ!", m.text + when, emoji =>
-                {
-                    relay.Publish(Make("react", emoji));
-                    Notice.Show("sent", "ส่ง " + emoji + " ให้ " + FriendLabel + " แล้ว", null, null);
-                });
+                Notice.Show("done", "🔥 " + FriendLabel + " ทำสำเร็จ!", m.text + when, AnswerFriend);
             else if (m.type == "react")
                 Notice.Show("react", FriendLabel + " ส่ง " + m.text + " ให้คุณ" + when, null, null);
+            else if (m.type == "reply")
+                Notice.Show("reply", "💬 " + FriendLabel + " ตอบกลับ" + when, m.text, AnswerFriend);   // can answer back: a little chat
             else if (m.type == "accept")
                 Notice.Show("accept", "👍 " + FriendLabel + " รับงานที่คุณส่งแล้ว" + when, m.text, null);
             else if (m.type == "reject")
                 Notice.Show("reject", FriendLabel + " ไม่รับงานที่คุณส่ง" + when, m.text, null);
+        }
+
+        // An emoji or a typed answer from a pop-up goes to the friend
+        void AnswerFriend(string text, bool reply)
+        {
+            relay.Publish(Make(reply ? "reply" : "react", text));
+            if (reply) Notice.Show("sent", "ตอบกลับ " + FriendLabel + " แล้ว 💬", text, null);
+            else Notice.Show("sent", "ส่ง " + text + " ให้ " + FriendLabel + " แล้ว", null, null);
         }
 
         // The friend's new list, but finished tasks stay here until they've been seen for a day (or removed here)
@@ -1454,6 +1729,7 @@ namespace FriendlyFire
             ok.Click += (s, e) => f.Close();
             f.Controls.AddRange(new Control[] { box, copy, join, joinBtn, note, ok });
             f.AcceptButton = joinBtn;
+            Theme.Apply(f);
             f.Show();
         }
 
@@ -1474,6 +1750,13 @@ namespace FriendlyFire
             Program.ReleaseLock();
             Process.Start(Application.ExecutablePath, Program.RestartArgs + " --restart");
             ExitThread();
+        }
+
+        public void SetTheme()
+        {
+            Theme.Set(Cfg.themeMode, Cfg.themeColor);
+            if (!Cfg.stayFixed) { if (Cfg.notifyExtra == -1) Cfg.notifyExtra = Notice.Forever; Cfg.stayFixed = true; }
+            Save();
         }
 
         public void ShowSettings()
@@ -1574,7 +1857,7 @@ namespace FriendlyFire
 
     static class Program
     {
-        public const string Version = "1.0.9";
+        public const string Version = "1.1.0";
         public static Icon Flame;
         static Mutex mutex;
         public static string RestartArgs = "";   // the same -Data/-Name/-Code after an update
@@ -1583,6 +1866,13 @@ namespace FriendlyFire
 
         // Shown in Settings → บันทึกการอัปเดต (newest first; add a line with each release)
         public const string Changelog =
+            "-----30/10/2569-----\n" +
+            "v1.1.0\n" +
+            "• โหมดมืด: ตั้งค่า → หน้าตา เลือก สว่าง / มืด / ตาม Windows (เปลี่ยนตาม Windows ได้ทันที)\n" +
+            "• สีธีม 6 แบบ: ส้มไฟ, ฟ้าทะเล, ม่วงลาเวนเดอร์, ชมพูซากุระ, เขียวมิ้นต์, เทากราไฟต์ (ใช้กับปุ่ม, หัวข้อ, ป๊อปอัป, เส้นตอนลาก)\n" +
+            "• แสดงนาน: พิมพ์จำนวนวินาทีเองได้ (เช่น +4 หรือ -2) ป๊อปอัปแสดงอย่างน้อย 1 วินาที\n" +
+            "• เปลี่ยนเวลาแสดงแล้ว ป๊อปอัปที่ขึ้นอยู่เปลี่ยนตามทันที และปุ่ม \"ลองดูป๊อปอัป\" กดซ้ำได้ (แสดงตามค่าตอนนี้ แล้วหายไปตามปกติ)\n" +
+            "• ตั้งค่า → ปุ่มรีแอคชัน → บนป๊อปอัป: เลือก รีแอคชัน หรือ ไม่มี (ไม่มีปุ่มบนป๊อปอัป)\n\n" +
             "-----29/10/2569-----\n" +
             "v1.0.9\n" +
             "• อัปเดตปลอดภัยขึ้น: ลองเปิดไฟล์ใหม่ก่อนสลับ ถ้า Windows บล็อก (เช่น Smart App Control) จะใช้เวอร์ชันเดิมต่อและเด้งบอก ไม่หายไปเฉย ๆ\n\n" +
