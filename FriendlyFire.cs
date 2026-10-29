@@ -54,6 +54,7 @@ namespace FriendlyFire
         public List<string> notifyOff = new List<string> { "accept", "reject" };   // kinds turned off in Settings → ขั้นสูง
         public List<string> reactions = new List<string> { "🔥", "😎", "👍", "❓" };   // the 4 reaction buttons, chosen in Settings
         public int notifyExtra;                                  // pop-ups stay 1–8 s by text length plus this many seconds (-1 = until closed)
+        public string blockedVersion = "";                       // an update Windows would not run (Smart App Control): not tried again on its own
         public string notifyPlace = "br";                        // corner/edge: br bl tr tl bc tc
         public int notifySize = 1;                               // 0 small, 1 medium, 2 large
         public int doneKeepHours = 24;                           // finished tasks go away this long after they were seen here (0 = never)
@@ -201,9 +202,11 @@ namespace FriendlyFire
     {
         public const string Repo = "Zerocasidor/FriendlyFire";
 
-        // Downloads a newer FriendlyFire.exe next to this one (as .new) and returns its path, or null
-        public static string Download()
+        // Downloads a newer FriendlyFire.exe next to this one (as FriendlyFire.new.exe) and returns its path, or null.
+        // skip: a version not to download again (one Windows blocked before)
+        public static string Download(string skip, out string version)
         {
+            version = null;
             var req = (HttpWebRequest)WebRequest.Create("https://api.github.com/repos/" + Repo + "/releases/latest");
             req.UserAgent = "FriendlyFire/" + Program.Version;
             req.Accept = "application/vnd.github+json";
@@ -214,13 +217,15 @@ namespace FriendlyFire
             var rel = Util.Json.Deserialize<Dictionary<string, object>>(json);
             Version latest;
             if (!Version.TryParse(((string)rel["tag_name"]).TrimStart('v', 'V'), out latest) || latest <= new Version(Program.Version)) return null;
+            version = latest.ToString();
+            if (version == skip) return null;
 
             string url = null;
             foreach (Dictionary<string, object> a in (System.Collections.ArrayList)rel["assets"])
                 if ("FriendlyFire.exe".Equals(a["name"])) url = (string)a["browser_download_url"];
             if (url == null) return null;
 
-            string exe = Application.ExecutablePath, tmp = exe + ".new";
+            string exe = Application.ExecutablePath, tmp = Path.Combine(Path.GetDirectoryName(exe), "FriendlyFire.new.exe");
             using (var wc = new WebClient())
             {
                 wc.Headers[HttpRequestHeader.UserAgent] = "FriendlyFire/" + Program.Version;
@@ -229,6 +234,23 @@ namespace FriendlyFire
             if (new FileInfo(tmp).Length < 20000) { File.Delete(tmp); return null; }   // not a real exe
             return tmp;
         }
+
+        // Runs the downloaded exe once with --probe (it exits right away with code 7) to make sure Windows lets it run
+        // (Smart App Control blocks new unsigned exes); returns null when it ran, else why not
+        public static string Probe(string newExe)
+        {
+            try
+            {
+                using (var p = Process.Start(new ProcessStartInfo(newExe, "--probe") { UseShellExecute = false, CreateNoWindow = true }))
+                {
+                    if (!p.WaitForExit(30000)) { try { p.Kill(); } catch { } return "ไฟล์ใหม่ไม่ตอบสนอง"; }
+                    return p.ExitCode == ProbeCode ? null : "ไฟล์ใหม่เปิดไม่ขึ้น (รหัส " + p.ExitCode + ")";
+                }
+            }
+            catch (Exception ex) { return ex.Message; }
+        }
+
+        public const int ProbeCode = 7;
 
         // A running exe can be renamed but not overwritten: move it aside, put the new one in its place
         public static void Swap(string newExe)
@@ -239,9 +261,18 @@ namespace FriendlyFire
             File.Move(newExe, exe);
         }
 
+        // Undo Swap: the old exe back in place (the new one is thrown away)
+        public static void SwapBack()
+        {
+            string exe = Application.ExecutablePath, old = exe + ".old";
+            if (File.Exists(exe)) File.Delete(exe);
+            File.Move(old, exe);
+        }
+
         public static void CleanUp()
         {
-            try { string old = Application.ExecutablePath + ".old"; if (File.Exists(old)) File.Delete(old); } catch { }
+            foreach (string f in new[] { Application.ExecutablePath + ".old", Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "FriendlyFire.new.exe") })
+                try { if (File.Exists(f)) File.Delete(f); } catch { }
         }
     }
 
@@ -1480,27 +1511,49 @@ namespace FriendlyFire
             updating = true;
             ThreadPool.QueueUserWorkItem(_ =>
             {
-                string newExe = null, error = null;
-                try { newExe = Updater.Download(); }
+                string newExe = null, error = null, version = null, blocked = null;
+                try
+                {
+                    newExe = Updater.Download(byHand ? null : Cfg.blockedVersion, out version);   // checking by hand tries a blocked version again
+                    if (newExe != null && (blocked = Updater.Probe(newExe)) != null) { try { File.Delete(newExe); } catch { } newExe = null; }
+                }
                 catch (Exception ex) { error = ex.Message; }
                 ui.BeginInvoke((Action)(() =>
                 {
                     updating = false;
-                    if (newExe != null) Restart(newExe);
+                    if (blocked != null) { Blocked(version, blocked); return; }
+                    if (newExe != null) { Cfg.blockedVersion = ""; Save(); Restart(newExe, version); }
                     else if (byHand) Notice.Show(error == null ? "เป็นเวอร์ชันล่าสุดแล้ว" : "ตรวจอัปเดตไม่ได้", error == null ? "v" + Program.Version : error, null);
                 }));
             });
         }
 
-        void Restart(string newExe)
+        void Restart(string newExe, string version)
         {
             try { Updater.Swap(newExe); }
             catch (Exception ex) { Notice.Show("อัปเดตไม่สำเร็จ", ex.Message, null); return; }
+            // Start the new copy before letting go of anything (it waits for this one to exit); if it does not start, keep this version
+            try { Process.Start(Application.ExecutablePath, Program.RestartArgs + " --updated"); }
+            catch (Exception ex)
+            {
+                try { Updater.SwapBack(); } catch { }
+                Blocked(version, ex.Message);
+                return;
+            }
             relay.Stop();
             tray.Visible = false;
             Program.ReleaseLock();
-            Process.Start(Application.ExecutablePath, Program.RestartArgs + " --updated");
             ExitThread();
+        }
+
+        // Windows would not run the new version: stay on this one, do not try that version again by itself, and say why
+        void Blocked(string version, string why)
+        {
+            Cfg.blockedVersion = version ?? "";
+            Save();
+            Notice.Show("อัปเดต v" + version + " ไม่ได้",
+                "Windows ไม่ยอมเปิดไฟล์ใหม่ (อาจเป็น Smart App Control) เลยใช้ v" + Program.Version + " ต่อไปก่อน\n" +
+                "แก้แล้วกด ⚙ ตั้งค่า → ตรวจหาอัปเดต เพื่อลองใหม่\n(" + why + ")", null);
         }
 
         void Quit()
@@ -1521,7 +1574,7 @@ namespace FriendlyFire
 
     static class Program
     {
-        public const string Version = "1.0.8";
+        public const string Version = "1.0.9";
         public static Icon Flame;
         static Mutex mutex;
         public static string RestartArgs = "";   // the same -Data/-Name/-Code after an update
@@ -1531,6 +1584,8 @@ namespace FriendlyFire
         // Shown in Settings → บันทึกการอัปเดต (newest first; add a line with each release)
         public const string Changelog =
             "-----29/10/2569-----\n" +
+            "v1.0.9\n" +
+            "• อัปเดตปลอดภัยขึ้น: ลองเปิดไฟล์ใหม่ก่อนสลับ ถ้า Windows บล็อก (เช่น Smart App Control) จะใช้เวอร์ชันเดิมต่อและเด้งบอก ไม่หายไปเฉย ๆ\n\n" +
             "v1.0.8\n" +
             "• แก้ภาพกระพริบตอนลากงานผ่านงานอื่น\n" +
             "• ป๊อปอัปที่ซ้ำกัน (กดรัว ๆ) ขึ้นแค่ครั้งเดียว และกด ✕ ครั้งเดียวปิดป๊อปอัปที่รอคิวอยู่ทั้งหมด (มีบอก +N รอ)\n\n" +
@@ -1580,6 +1635,7 @@ namespace FriendlyFire
         [STAThread]
         static void Main(string[] args)
         {
+            if (args.Length == 1 && args[0] == "--probe") { Environment.Exit(Updater.ProbeCode); return; }   // the updater checking Windows lets this exe run
             Thread.CurrentThread.CurrentCulture = CultureInfo.InvariantCulture;
             ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;   // ntfy.sh and GitHub need TLS 1.2
 
