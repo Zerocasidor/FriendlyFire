@@ -289,10 +289,8 @@ namespace FriendlyFire
 
         // What the person did on a pop-up: an emoji button (reply = false) or a typed answer (reply = true)
         public delegate void Answer(string text, bool reply);
-        // "reply" (type an answer on the pop-up, message type "reply") is built but not offered yet: it still needs a real two-PC test.
-        // To turn it on: add "reply" / "ตอบกลับ (พิมพ์ข้อความ)" here and the "reply" row to Kinds
-        public static readonly string[] AnswerModes = { "react", "none" };
-        public static readonly string[] AnswerModeNames = { "รีแอคชัน (ปุ่มอีโมจิ)", "ไม่มี" };
+        public static readonly string[] AnswerModes = { "react", "reply", "none" };
+        public static readonly string[] AnswerModeNames = { "รีแอคชัน (ปุ่มอีโมจิ)", "ตอบกลับ (พิมพ์ข้อความ)", "ไม่มี" };
         static readonly List<Pending> waiting = new List<Pending>();
         static Notice current;
         static string currentKey;
@@ -314,6 +312,7 @@ namespace FriendlyFire
         {
             new[] { "done",   "เพื่อนทำงานสำเร็จ" },
             new[] { "react",  "เพื่อนส่งรีแอคชันให้" },
+            new[] { "reply",  "เพื่อนตอบกลับ" },
             new[] { "gift",   "เพื่อนส่งงานให้" },
             new[] { "accept", "เพื่อนรับงานที่คุณส่ง" },
             new[] { "reject", "เพื่อนไม่รับงานที่คุณส่ง" },
@@ -1422,6 +1421,7 @@ namespace FriendlyFire
             if (Cfg.clientId == "") Cfg.clientId = Util.RandomCode(12);
             Theme.Set(Cfg.themeMode, Cfg.themeColor);
             if (!Cfg.stayFixed) { if (Cfg.notifyExtra == -1) Cfg.notifyExtra = Notice.Forever; Cfg.stayFixed = true; }
+            if (Array.IndexOf(Notice.AnswerModes, Cfg.answerMode) < 0) Cfg.answerMode = "react";   // a mode that is switched off (e.g. "reply" from a test)
             ui.CreateControl();
 
             // First run: name and pair (or from the command line, for testing)
@@ -1755,7 +1755,6 @@ namespace FriendlyFire
         public void SetTheme()
         {
             Theme.Set(Cfg.themeMode, Cfg.themeColor);
-            if (!Cfg.stayFixed) { if (Cfg.notifyExtra == -1) Cfg.notifyExtra = Notice.Forever; Cfg.stayFixed = true; }
             Save();
         }
 
@@ -1857,7 +1856,7 @@ namespace FriendlyFire
 
     static class Program
     {
-        public const string Version = "1.1.0";
+        public const string Version = "1.1.1";
         public static Icon Flame;
         static Mutex mutex;
         public static string RestartArgs = "";   // the same -Data/-Name/-Code after an update
@@ -1866,6 +1865,9 @@ namespace FriendlyFire
 
         // Shown in Settings → บันทึกการอัปเดต (newest first; add a line with each release)
         public const string Changelog =
+            "-----02/11/2569-----\n" +
+            "v1.1.1\n" +
+            "• ตอบกลับที่ป๊อปอัปได้: ตั้งค่า → ปุ่มรีแอคชัน → บนป๊อปอัป → ตอบกลับ พิมพ์แล้วกด Enter เพื่อนจะเห็นข้อความและตอบกลับไปมาได้\n\n" +
             "-----30/10/2569-----\n" +
             "v1.1.0\n" +
             "• โหมดมืด: ตั้งค่า → หน้าตา เลือก สว่าง / มืด / ตาม Windows (เปลี่ยนตาม Windows ได้ทันที)\n" +
